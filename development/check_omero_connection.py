@@ -45,7 +45,12 @@ def _load_image(conn, upload_segmentation_to_omero):
     if upload_segmentation_to_omero:
 
         # Store the segmentations locally for storing them either as polygons or something else.
-        segmentation = viewer.layers["committed_objects"].data
+        try:
+            from micro_sam.sam_annotator._state import AnnotatorState
+
+            segmentation = AnnotatorState().annotator.get_layer_data("committed_objects")
+        except Exception:
+            segmentation = viewer.layers["committed_objects"].data
 
         # Let's try converting them as polygons, store them as a list of polygons and put it back.
         contours = find_contours(segmentation)[0]  # Get contours

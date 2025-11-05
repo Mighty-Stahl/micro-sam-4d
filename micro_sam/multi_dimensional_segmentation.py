@@ -350,12 +350,37 @@ def merge_instance_segmentation_3d(
     # Extract the overlap between slices.
     edges = track_utils.compute_edges_from_overlap(slice_segmentation, verbose=False)
 
+    # If the whole stacked segmentation is empty, return an empty segmentation.
+    if int(slice_segmentation.max()) == 0:
+        if verbose:
+            print("⚠️ Skipping empty segmentation in merge_instance_segmentation_3d()")
+        # ensure we return an array of the same shape
+        pbar_update(1)
+        pbar_close()
+        return np.zeros_like(slice_segmentation, dtype=slice_segmentation.dtype)
+
     uv_ids = np.array([[edge["source"], edge["target"]] for edge in edges])
     overlaps = np.array([edge["score"] for edge in edges])
 
+    # If no edges were found, nothing to merge across slices — return the input.
+    if uv_ids.size == 0:
+        if verbose:
+            print("⚠️ Skipping empty segmentation in merge_instance_segmentation_3d(): no overlap edges found")
+        pbar_update(1)
+        pbar_close()
+        return slice_segmentation.copy()
+
+    # cast edge indices to uint64 for nifty
+    try:
+        uv_ids = uv_ids.astype(np.uint64)
+    except Exception:
+        uv_ids = np.array(uv_ids, dtype=np.uint64)
+
     n_nodes = int(slice_segmentation.max() + 1)
     graph = nifty.graph.undirectedGraph(n_nodes)
-    graph.insertEdges(uv_ids)
+    # only insert edges if we have any
+    if uv_ids.size > 0:
+        graph.insertEdges(uv_ids)
 
     costs = seg_utils.multicut.compute_edge_costs(overlaps)
     # Set background weights to be maximally repulsive.

@@ -1104,7 +1104,13 @@ def set_precomputed(
 
     device = predictor.device
     features = image_embeddings["features"]
-    assert features.ndim in (4, 5), f"{features.ndim}"
+    # Defensive check: ensure we have an array-like dataset (zarr.Array, numpy array or tensor)
+    if not (hasattr(features, "ndim") or hasattr(features, "shape")):
+        raise TypeError(
+            f"Invalid image_embeddings['features'] type: {type(features)}. "
+            "Expected a zarr.Array or numpy array dataset. Ensure your zarr store contains an array dataset (commonly named 'features')."
+        )
+    assert getattr(features, "ndim", None) in (4, 5), f"{getattr(features, 'ndim', None)}"
     if features.ndim == 5 and i is None:
         raise ValueError("The data is 3D so an index i is needed.")
     elif features.ndim == 4 and i is not None:
@@ -1139,8 +1145,39 @@ def compute_iou(mask1: np.ndarray, mask2: np.ndarray) -> float:
     Returns:
         The intersection over union of the two masks.
     """
-    overlap = np.logical_and(mask1 == 1, mask2 == 1).sum()
-    union = np.logical_or(mask1 == 1, mask2 == 1).sum()
+    # Normalise masks to boolean arrays where True == foreground
+    m1 = (mask1 == 1)
+    m2 = (mask2 == 1)
+
+    # If m2 has an extra leading mask dimension (e.g. (1, H, W) or (N, H, W)),
+    # reduce it to a single 2D mask. For multiple masks take the logical OR.
+    try:
+        if m2.ndim > 2:
+            # If first axis is singleton (common case), squeeze it
+            if m2.shape[0] == 1:
+                m2 = m2.squeeze(0)
+            else:
+                # combine multiple masks into one
+                m2 = np.any(m2, axis=0)
+    except Exception:
+        pass
+
+    # If shapes differ, attempt a nearest-neighbour resize of m2 to m1's shape.
+    if getattr(m1, 'shape', None) != getattr(m2, 'shape', None):
+        try:
+            from skimage.transform import resize as _resize
+
+            # resize expects float-like input; use order=0 for nearest-neighbour
+            m2 = _resize(m2.astype('float32'), m1.shape, order=0, preserve_range=True, anti_aliasing=False) > 0.5
+        except Exception:
+            # If resize fails, fall back to attempting to squeeze extra dims and then broadcast
+            try:
+                m2 = np.reshape(m2, m1.shape)
+            except Exception:
+                raise ValueError(f"Cannot compare masks with shapes {m1.shape} and {m2.shape}")
+
+    overlap = np.logical_and(m1, m2).sum()
+    union = np.logical_or(m1, m2).sum()
     eps = 1e-7
     iou = float(overlap) / (float(union) + eps)
     return iou

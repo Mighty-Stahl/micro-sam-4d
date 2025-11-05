@@ -11,10 +11,40 @@ import napari
 import numpy as np
 from skimage import draw
 from scipy.ndimage import shift
+from skimage.transform import resize as _sk_resize
 
 from .. import prompt_based_segmentation, util
 from .. import _model_settings as model_settings
 from ..multi_dimensional_segmentation import _validate_projection
+from ._state import AnnotatorState
+
+
+def get_layer_data(viewer: napari.Viewer, name: str):
+    """Return layer data for `name`, preferring the annotator helpers for 4D-aware access.
+
+    Falls back to reading `viewer.layers[name].data` if no annotator is available.
+    """
+    try:
+        annotator = AnnotatorState().annotator
+        return annotator.get_layer_data(name)
+    except Exception:
+        return viewer.layers[name].data
+
+
+def set_layer_data(viewer: napari.Viewer, name: str, data):
+    """Set layer data for `name`, preferring the annotator helpers for 4D-aware writes.
+
+    Falls back to assigning to `viewer.layers[name].data` and refreshing the layer.
+    """
+    try:
+        annotator = AnnotatorState().annotator
+        annotator.set_layer_data(name, data)
+    except Exception:
+        viewer.layers[name].data = data
+        try:
+            viewer.layers[name].refresh()
+        except Exception:
+            pass
 
 # Green and Red
 LABEL_COLOR_CYCLE = ["#00FF00", "#FF0000"]
@@ -113,36 +143,68 @@ def _initialize_parser(description, with_segmentation_result=True, with_instance
 
 def clear_annotations(viewer: napari.Viewer, clear_segmentations=True) -> None:
     """@private"""
-    viewer.layers["point_prompts"].data = []
-    viewer.layers["point_prompts"].refresh()
+    # Use annotator helper if present to modify point_prompts in a 4D-aware way
+    try:
+        annotator = AnnotatorState().annotator
+        annotator.set_layer_data("point_prompts", np.array([]))
+    except Exception:
+        if "point_prompts" in viewer.layers:
+            set_layer_data(viewer, "point_prompts", np.array([]))
     if "prompts" in viewer.layers:
         # Select all prompts and then remove them.
         # This is how it worked before napari 0.5.
         # viewer.layers["prompts"].data = []
-        viewer.layers["prompts"].selected_data = set(range(len(viewer.layers["prompts"].data)))
-        viewer.layers["prompts"].remove_selected()
-        viewer.layers["prompts"].refresh()
+        try:
+            annotator = AnnotatorState().annotator
+            # Use annotator helper to clear prompts when available
+            annotator.set_layer_data("prompts", np.array([]))
+        except Exception:
+            viewer.layers["prompts"].selected_data = set(range(len(get_layer_data(viewer, "prompts"))))
+            viewer.layers["prompts"].remove_selected()
+            viewer.layers["prompts"].refresh()
     if not clear_segmentations:
         return
-    viewer.layers["current_object"].data = np.zeros(viewer.layers["current_object"].data.shape, dtype="uint32")
-    viewer.layers["current_object"].refresh()
+    try:
+        annotator = AnnotatorState().annotator
+        zeros = np.zeros(annotator.get_layer_data("current_object").shape, dtype="uint32")
+        annotator.set_layer_data("current_object", zeros)
+    except Exception:
+        if "current_object" in viewer.layers:
+            set_layer_data(viewer, "current_object", np.zeros(get_layer_data(viewer, "current_object").shape, dtype="uint32"))
 
 
 def clear_annotations_slice(viewer: napari.Viewer, i: int, clear_segmentations=True) -> None:
     """@private"""
-    point_prompts = viewer.layers["point_prompts"].data
-    point_prompts = point_prompts[point_prompts[:, 0] != i]
-    viewer.layers["point_prompts"].data = point_prompts
-    viewer.layers["point_prompts"].refresh()
+    try:
+        annotator = AnnotatorState().annotator
+        pts = annotator.get_layer_data("point_prompts")
+        pts = pts[pts[:, 0] != i]
+        annotator.set_layer_data("point_prompts", pts)
+    except Exception:
+        point_prompts = get_layer_data(viewer, "point_prompts")
+        point_prompts = point_prompts[point_prompts[:, 0] != i]
+        set_layer_data(viewer, "point_prompts", point_prompts)
     if "prompts" in viewer.layers:
-        prompts = viewer.layers["prompts"].data
-        prompts = [prompt for prompt in prompts if not (prompt[:, 0] == i).all()]
-        viewer.layers["prompts"].data = prompts
-        viewer.layers["prompts"].refresh()
+        try:
+            annotator = AnnotatorState().annotator
+            prompts = annotator.get_layer_data("prompts")
+            prompts = [prompt for prompt in prompts if not (prompt[:, 0] == i).all()]
+            annotator.set_layer_data("prompts", prompts)
+        except Exception:
+            prompts = get_layer_data(viewer, "prompts")
+            prompts = [prompt for prompt in prompts if not (prompt[:, 0] == i).all()]
+            set_layer_data(viewer, "prompts", prompts)
     if not clear_segmentations:
         return
-    viewer.layers["current_object"].data[i] = 0
-    viewer.layers["current_object"].refresh()
+    try:
+        annotator = AnnotatorState().annotator
+        curr = annotator.get_layer_data("current_object")
+        curr[i] = 0
+        annotator.set_layer_data("current_object", curr)
+    except Exception:
+        curr = get_layer_data(viewer, "current_object")
+        curr[i] = 0
+        set_layer_data(viewer, "current_object", curr)
 
 
 #
@@ -347,7 +409,36 @@ def segment_slices_with_prompts(
     predictor, point_prompts, box_prompts, image_embeddings, shape, track_id=None, update_progress=None,
 ):
     """@private"""
-    assert len(shape) == 3
+    # Accept either a 3-tuple (Z, Y, X) or a 4-tuple with a leading channel dimension
+    # (C, Z, Y, X) or (channels, Z, Y, X) commonly provided as state.image_shape.
+    # If `shape` is None, try to infer it from image_embeddings or predictor, otherwise
+    # raise a helpful error to avoid a NoneType subscriptable TypeError later.
+    if shape is None:
+        # Try image_embeddings original/input size (spatial), note these are (H,W)
+        inferred = None
+        try:
+            if image_embeddings is not None:
+                if image_embeddings.get("original_size") is not None:
+                    inferred = tuple(image_embeddings.get("original_size"))
+                elif image_embeddings.get("input_size") is not None:
+                    inferred = tuple(image_embeddings.get("input_size"))
+        except Exception:
+            inferred = None
+        # Try predictor.original_size (SAM predictor stores (H,W) for 2D)
+        if inferred is None:
+            try:
+                inferred = tuple(getattr(predictor, "original_size", None))
+            except Exception:
+                inferred = None
+        if inferred is None:
+            raise RuntimeError("Cannot determine image shape for segmentation. Ensure AnnotatorState.image_shape is set or provide embeddings with metadata.")
+        # We have spatial (H,W); assume single z slice when only 2D information is available.
+        shape = (1,) + tuple(inferred)
+
+    if len(shape) == 4:
+        # drop the leading channel dimension
+        shape = shape[1:]
+    assert len(shape) == 3, f"expected shape of length 3 (Z,Y,X) or 4 (C,Z,Y,X), got {shape}"
     image_shape = shape[1:]
     seg = np.zeros(shape, dtype="uint32")
 
@@ -407,6 +498,18 @@ def segment_slices_with_prompts(
             print("This will lead to a wrong segmentation across slices or frames.")
             print(f"Please correct the prompts in {i} and rerun the segmentation.")
             continue
+
+        # Ensure the returned slice matches the expected image_shape (Y,X).
+        try:
+            target_shape = tuple(image_shape)
+            if getattr(seg_i, "shape", None) != target_shape:
+                # resize using nearest-neighbor (order=0) to preserve labels
+                seg_i = _sk_resize(seg_i.astype("float32"), target_shape, order=0, preserve_range=True, anti_aliasing=False).astype(seg.dtype)
+        except Exception:
+            # If resizing fails for some reason, fall back to attempting a best-effort
+            # center-crop or pad. For now, we will skip resizing and let the assign
+            # raise a clear error which can be inspected.
+            pass
 
         seg[i] = seg_i
         update_progress(1)
@@ -642,7 +745,7 @@ def track_from_prompts(
             # if yes: we only continue tracking if overlaps are above the threshold
             if t < slices[-1]:
                 seg_prev = None
-
+                
             update_progress(1)
 
         if (threshold is not None) and (seg_prev is not None):

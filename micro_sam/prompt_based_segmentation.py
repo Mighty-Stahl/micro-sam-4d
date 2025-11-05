@@ -240,9 +240,61 @@ def _initialize_predictor(predictor, image_embeddings, i, prompts, to_tile):
 
 
 def _tile_to_full_mask(mask, shape, tile):
-    full_mask = np.zeros(mask.shape[0:1] + tuple(shape), dtype=mask.dtype)
-    bb = tuple(slice(beg, end) for beg, end in zip(tile.begin, tile.end))
-    full_mask[(slice(None),) + bb] = mask
+    """Place a (tile) mask into a full-size mask safely.
+
+    Handles cases where the provided tile may extend beyond image bounds by
+    cropping the predicted mask to fit the image bounding box. Supports
+    masks with a leading mask dimension (N, H, W) or a single (H, W) mask.
+    """
+    # Prepare full-size container. Determine leading mask dims: if mask is 2D
+    # treat it as a single mask (leading dim = 1); otherwise keep existing
+    # leading mask dimension(s) (commonly (N,)).
+    if mask.ndim == 2:
+        leading = (1,)
+    else:
+        # preserve any leading mask dimensions (e.g., (N,))
+        leading = mask.shape[0:1]
+    full_mask = np.zeros(leading + tuple(shape), dtype=mask.dtype)
+
+    # Compute bounding box clipped to image shape
+    bb_slices = []
+    for dim, (beg, end) in enumerate(zip(tile.begin, tile.end)):
+        clipped_end = min(end, shape[dim])
+        clipped_beg = max(0, min(beg, clipped_end))
+        bb_slices.append(slice(clipped_beg, clipped_end))
+    bb = tuple(bb_slices)
+
+    # Target region shape
+    target_h = bb[0].stop - bb[0].start
+    target_w = bb[1].stop - bb[1].start
+
+    # Crop the input mask if it is larger than the target region
+    try:
+        if mask.ndim == 3:
+            # mask shape: (N, H, W) or (1, H, W)
+            mask_cropped = mask[:, :target_h, :target_w]
+        elif mask.ndim == 2:
+            mask_cropped = mask[:target_h, :target_w]
+            # add a leading singleton dim for assignment
+            mask_cropped = mask_cropped[None]
+        else:
+            # Unexpected rank: try to reshape conservatively
+            mask_cropped = mask.reshape((mask.shape[0],) + (mask.shape[-2], mask.shape[-1]))
+            mask_cropped = mask_cropped[:, :target_h, :target_w]
+    except Exception:
+        # Fallback: attempt to broadcast/truncate to target shape
+        mask_cropped = mask[..., :target_h, :target_w]
+
+    # If mask_cropped spatial dims are smaller than target (shouldn't usually happen), pad
+    mh = mask_cropped.shape[-2]
+    mw = mask_cropped.shape[-1]
+    if mh != target_h or mw != target_w:
+        padded = np.zeros((mask_cropped.shape[0], target_h, target_w), dtype=mask_cropped.dtype)
+        padded[:, :mh, :mw] = mask_cropped
+        mask_cropped = padded
+
+    # Write into the full mask
+    full_mask[(slice(None),) + bb] = mask_cropped
     return full_mask
 
 
@@ -305,6 +357,20 @@ def segment_from_points(
 
     if tile is not None:
         mask = _tile_to_full_mask(mask, shape, tile)
+    # Normalize mask shape: prefer a 2D mask (H, W) for callers that
+    # expect a single binary mask per slice. If the predictor returned
+    # multiple masks, choose the highest-scoring one when scores are
+    # available; otherwise take the first.
+    if mask is not None:
+        if mask.ndim == 3:
+            if mask.shape[0] == 1:
+                mask = mask[0]
+            else:
+                if scores is not None:
+                    best = int(np.argmax(scores))
+                    mask = mask[best]
+                else:
+                    mask = mask[0]
 
     if return_all:
         return mask, scores, logits
@@ -409,8 +475,14 @@ def segment_from_mask(
         mask = _tile_to_full_mask(mask, shape, tile)
 
     if return_all:
+        # Ensure returned mask is 2D when requested alongside scores/logits
+        if mask is not None and mask.ndim == 3 and mask.shape[0] == 1:
+            mask = mask[0]
         return mask, scores, logits
     else:
+        # Prefer to return a 2D mask for the caller
+        if mask is not None and mask.ndim == 3 and mask.shape[0] == 1:
+            mask = mask[0]
         return mask
 
 
@@ -451,8 +523,12 @@ def segment_from_box(
         mask = _tile_to_full_mask(mask, shape, tile)
 
     if return_all:
+        if mask is not None and mask.ndim == 3 and mask.shape[0] == 1:
+            mask = mask[0]
         return mask, scores, logits
     else:
+        if mask is not None and mask.ndim == 3 and mask.shape[0] == 1:
+            mask = mask[0]
         return mask
 
 

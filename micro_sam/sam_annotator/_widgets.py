@@ -15,21 +15,33 @@ import z5py
 import napari
 import numpy as np
 
+from .annotator_4d import MicroSAM4DAnnotator
+Annotator4d = MicroSAM4DAnnotator
+
 import nifty.ground_truth as ngt
 
 import elf.parallel
 
 from qtpy import QtWidgets
-from qtpy.QtCore import QObject, Signal
+from qtpy.QtCore import QObject, Signal, Qt
 from superqt import QCollapsible
 from napari.utils.notifications import show_info
 from magicgui import magic_factory
 from magicgui.widgets import ComboBox, Container, create_widget
-# We have disabled the thread workers for now because they result in a
+from qtpy.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QLineEdit,
+    QLabel,
+)# We have disabled the thread workers for now because they result in a
 # massive slowdown in napari >= 0.5.
 # See also https://forum.image.sc/t/napari-thread-worker-leads-to-massive-slowdown/103786
 # from napari.qt.threading import thread_worker
 from napari.utils import progress
+
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QComboBox
 
 from . import util as vutil
 from ._tooltips import get_tooltip
@@ -64,6 +76,7 @@ class _WidgetBase(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setLayout(QtWidgets.QVBoxLayout())
+    
 
     def _add_boolean_param(self, name, value, title=None, tooltip=None):
         checkbox = QtWidgets.QCheckBox(name if title is None else title)
@@ -356,6 +369,59 @@ class _WidgetBase(QtWidgets.QWidget):
 
 
 # Custom signals for managing progress updates.
+class IdRemapperWidget(_WidgetBase):
+    """Widget for remapping segment IDs in a 4D segmentation."""
+    def __init__(self, annotator, parent=None):
+        super().__init__(parent)
+        self._annotator = annotator
+
+        # Create input fields for ID mapping
+        id_layout = QtWidgets.QHBoxLayout()
+
+        # Old ID
+        old_id_label = QtWidgets.QLabel("Old ID:")
+        id_layout.addWidget(old_id_label)
+
+        self.old_id_input = QtWidgets.QSpinBox()
+        self.old_id_input.setMinimum(1)
+        self.old_id_input.setMaximum(999999)
+        id_layout.addWidget(self.old_id_input)
+
+        # New ID
+        new_id_label = QtWidgets.QLabel("New ID:")
+        id_layout.addWidget(new_id_label)
+
+        self.new_id_input = QtWidgets.QSpinBox()
+        self.new_id_input.setMinimum(1)
+        self.new_id_input.setMaximum(999999)
+        id_layout.addWidget(self.new_id_input)
+
+        self.layout().addLayout(id_layout)
+
+        # Add propagation checkbox
+        propagate_layout = QtWidgets.QHBoxLayout()
+        self.propagate_checkbox = QtWidgets.QCheckBox("Propagate To All T")
+        propagate_layout.addWidget(self.propagate_checkbox)
+        self.layout().addLayout(propagate_layout)
+
+        # Add apply button
+        self.apply_button = QtWidgets.QPushButton("Apply Remapping")
+        self.apply_button.clicked.connect(self._apply_remap)
+        self.layout().addWidget(self.apply_button)
+
+    def _apply_remap(self):
+        """Apply the ID remapping for the current timestep."""
+        old_id = self.old_id_input.value()
+        new_id = self.new_id_input.value()
+        propagate = self.propagate_checkbox.isChecked()
+
+        try:
+            t = int(getattr(self._annotator, "current_timestep", 0) or 0)
+            self._annotator.remap_segment_id(t, old_id, new_id, propagate)
+        except Exception as e:
+            print(f"Error during ID remapping: {str(e)}")
+
+
 class PBarSignals(QObject):
     pbar_total = Signal(int)
     pbar_update = Signal(int)
@@ -511,17 +577,19 @@ def _commit_impl(viewer, layer, preserve_mode, preservation_threshold):
 
     # Cast the dtype of the segmentation we work with correctly.
     # Otherwise we run into type conversion errors later.
-    dtype = viewer.layers["committed_objects"].data.dtype
-    seg = viewer.layers[layer].data[bb].astype(dtype)
+    # Use annotator helper to retrieve per-timestep or regular layer data
+    annotator = state.annotator
+    dtype = annotator.get_layer_data("committed_objects").dtype
+    seg = annotator.get_layer_data(layer)[bb].astype(dtype)
     shape = seg.shape
 
     # We parallelize these operations because they take quite long for large volumes.
 
     # Compute the max id in the commited objects.
     # id_offset = int(viewer.layers["committed_objects"].data.max())
-    full_shape = viewer.layers["committed_objects"].data.shape
+    full_shape = annotator.get_layer_data("committed_objects").shape
     id_offset = int(
-        elf.parallel.max(viewer.layers["committed_objects"].data, block_shape=util.get_block_shape(full_shape))
+        elf.parallel.max(annotator.get_layer_data("committed_objects"), block_shape=util.get_block_shape(full_shape))
     )
 
     # Compute the mask for the current object.
@@ -531,7 +599,7 @@ def _commit_impl(viewer, layer, preserve_mode, preservation_threshold):
         seg, 0, np.not_equal, out=mask, block_shape=util.get_block_shape(shape)
     )
     if preserve_mode != "none":
-        prev_seg = viewer.layers["committed_objects"].data[bb]
+        prev_seg = annotator.get_layer_data("committed_objects")[bb]
         # The mode 'pixels' corresponds to a naive implementation where only committed pixels are preserved.
         preserve_mask = prev_seg != 0
         # If the preserve mask is empty we don't need to do anything else here, because we don't have prev objects.
@@ -544,8 +612,14 @@ def _commit_impl(viewer, layer, preserve_mode, preservation_threshold):
 
     # Write the current object to committed objects.
     seg[mask] += id_offset
-    viewer.layers["committed_objects"].data[bb][mask] = seg[mask]
-    viewer.layers["committed_objects"].refresh()
+    committed = annotator.get_layer_data("committed_objects")
+    committed[bb][mask] = seg[mask]
+    annotator.set_layer_data("committed_objects", committed)
+    try:
+        if "committed_objects" in viewer.layers:
+            viewer.layers["committed_objects"].refresh()
+    except Exception:
+        pass
 
     return id_offset, seg, mask, bb
 
@@ -637,7 +711,7 @@ def _commit_to_file(path, viewer, layer, seg, mask, bb, extra_attrs=None):
         _save_signature(f, state.data_signature)
 
     # Write the segmentation.
-    full_shape = viewer.layers["committed_objects"].data.shape
+    full_shape = AnnotatorState().annotator.get_layer_data("committed_objects").shape
     block_shape = util.get_block_shape(full_shape)
     ds = f.require_dataset(
         "committed_objects", shape=full_shape, chunks=block_shape, compression="gzip", dtype=seg.dtype
@@ -683,10 +757,22 @@ def _commit_to_file(path, viewer, layer, seg, mask, bb, extra_attrs=None):
                 ds.attrs["track_state"] = track_state.tolist()
 
     # Get the prompts from the layers.
-    prompts = viewer.layers["prompts"].data
-    point_layer = viewer.layers["point_prompts"]
-    point_prompts = point_layer.data
-    point_labels = point_layer.properties["label"]
+    # prompts and point prompts are per-timestep interactive layers; use annotator helper
+    annotator = AnnotatorState().annotator
+    prompts = annotator.get_layer_data("prompts") if "prompts" in annotator._viewer.layers else np.array([])
+    # point_prompts may be a napari Points layer or stored per-timestep; try to get via annotator
+    if "point_prompts" in annotator._viewer.layers:
+        point_layer = annotator._viewer.layers["point_prompts"]
+        try:
+            point_prompts = annotator.get_layer_data("point_prompts")
+        except Exception:
+            point_prompts = np.array([])
+        point_labels = point_layer.properties.get("label", [])
+    else:
+        point_layer = None
+        point_prompts = np.array([])
+        point_labels = []
+
     if len(point_prompts) > 0:
         point_labels = np.array([1 if label == "positive" else 0 for label in point_labels])
         assert len(point_prompts) == len(point_labels), \
@@ -764,10 +850,14 @@ def commit(
     if layer == "current_object":
         vutil.clear_annotations(viewer)
     else:
-        viewer.layers["auto_segmentation"].data = np.zeros(
-            viewer.layers["auto_segmentation"].data.shape, dtype="uint32"
-        )
-        viewer.layers["auto_segmentation"].refresh()
+        annotator = AnnotatorState().annotator
+        zeros = np.zeros(annotator.get_layer_data("auto_segmentation").shape, dtype="uint32")
+        annotator.set_layer_data("auto_segmentation", zeros)
+        try:
+            if "auto_segmentation" in viewer.layers:
+                viewer.layers["auto_segmentation"].refresh()
+        except Exception:
+            pass
         _select_layer(viewer, "committed_objects")
 
     # Perform garbage collection
@@ -829,7 +919,7 @@ def commit_track(
 
     # Create / update the tracking layer.
     layer_name = "tracks"
-    segmentation = viewer.layers["committed_objects"].data
+    segmentation = AnnotatorState().annotator.get_layer_data("committed_objects")
     track_data, parent_graph = get_napari_track_data(segmentation, state.committed_lineages)
     if layer_name in viewer.layers:
         layer = viewer.layers[layer_name]
@@ -922,6 +1012,13 @@ def _validate_embeddings(viewer: "napari.viewer.Viewer"):
         msg = "Image embeddings are not yet computed. Press 'Compute Embeddings' to compute them for your image."
         return _generate_message("error", msg)
     else:
+        # Also ensure image_shape has been populated (required by segmentation helpers)
+        if state.image_shape is None:
+            msg = (
+                "Image shape is not set. This can happen when embeddings were computed without setting the image metadata. "
+                "Please compute embeddings via the Embedding widget or use the annotator 'Compute embeddings' UI so that the image shape is registered."
+            )
+            return _generate_message("error", msg)
         return False
 
     # This code is for checking the data signature of the current image layer and the data signature
@@ -985,8 +1082,16 @@ def _validate_layers(viewer: "napari.viewer.Viewer", automatic_segmentation: boo
     state.annotator._require_layers()
 
     if not automatic_segmentation:
-        # Check prompts layer.
-        if len(viewer.layers["prompts"].data) == 0 and len(viewer.layers["point_prompts"].data) == 0:
+        # Check prompts layer — prefer annotator helper for 4D-aware access.
+        try:
+            annotator = AnnotatorState().annotator
+            prompts_len = 0 if "prompts" not in annotator._viewer.layers else len(annotator.get_layer_data("prompts"))
+            points_len = 0 if "point_prompts" not in annotator._viewer.layers else len(annotator.get_layer_data("point_prompts"))
+        except Exception:
+            prompts_len = 0 if "prompts" not in viewer.layers else len(viewer.layers["prompts"].data)
+            points_len = 0 if "point_prompts" not in viewer.layers else len(viewer.layers["point_prompts"].data)
+
+        if prompts_len == 0 and points_len == 0:
             msg = "No prompts were given. Please provide prompts to run interactive segmentation."
             return _generate_message("error", msg)
         else:
@@ -1006,17 +1111,18 @@ def segment(viewer: "napari.viewer.Viewer", batched: bool = False) -> None:
     if _validate_layers(viewer):
         return None
 
-    shape = viewer.layers["current_object"].data.shape
+    shape = AnnotatorState().annotator.get_layer_data("current_object").shape
 
     # get the current box and point prompts
-    boxes, masks = vutil.shape_layer_to_prompts(viewer.layers["prompts"], shape)
-    points, labels = vutil.point_layer_to_prompts(viewer.layers["point_prompts"], with_stop_annotation=False)
+    boxes, masks = vutil.shape_layer_to_prompts(AnnotatorState().annotator._viewer.layers["prompts"], shape)
+    points, labels = vutil.point_layer_to_prompts(AnnotatorState().annotator._viewer.layers["point_prompts"], with_stop_annotation=False)
 
     predictor = AnnotatorState().predictor
     image_embeddings = AnnotatorState().image_embeddings
     seg = vutil.prompt_segmentation(
         predictor, points, labels, boxes, masks, shape, image_embeddings=image_embeddings,
-        multiple_box_prompts=True, batched=batched, previous_segmentation=viewer.layers["current_object"].data,
+        multiple_box_prompts=True, batched=batched,
+        previous_segmentation=AnnotatorState().annotator.get_layer_data("current_object"),
     )
 
     # no prompts were given or prompts were invalid, skip segmentation
@@ -1024,8 +1130,7 @@ def segment(viewer: "napari.viewer.Viewer", batched: bool = False) -> None:
         print("You either haven't provided any prompts or invalid prompts. The segmentation will be skipped.")
         return
 
-    viewer.layers["current_object"].data = seg
-    viewer.layers["current_object"].refresh()
+    AnnotatorState().annotator.set_layer_data("current_object", seg)
 
 
 @magic_factory(call_button="Segment Slice [S]")
@@ -1040,13 +1145,15 @@ def segment_slice(viewer: "napari.viewer.Viewer") -> None:
     if _validate_layers(viewer):
         return None
 
-    shape = viewer.layers["current_object"].data.shape[1:]
+    # Determine the 2D image shape (Y, X) for the current slice.
+    # For 4D data the layer shape is (T, Z, Y, X) so take the last two dims.
+    shape = AnnotatorState().annotator.get_layer_data("current_object").shape[-2:]
 
     position_world = viewer.dims.point
-    position = viewer.layers["point_prompts"].world_to_data(position_world)
+    position = AnnotatorState().annotator._viewer.layers["point_prompts"].world_to_data(position_world)
     z = int(position[0])
 
-    point_prompts = vutil.point_layer_to_prompts(viewer.layers["point_prompts"], z)
+    point_prompts = vutil.point_layer_to_prompts(AnnotatorState().annotator._viewer.layers["point_prompts"], z)
     # this is a stop prompt, we do nothing
     if not point_prompts:
         return
@@ -1065,8 +1172,10 @@ def segment_slice(viewer: "napari.viewer.Viewer") -> None:
         print("You either haven't provided any prompts or invalid prompts. The segmentation will be skipped.")
         return
 
-    viewer.layers["current_object"].data[z] = seg
-    viewer.layers["current_object"].refresh()
+    annotator = AnnotatorState().annotator
+    curr = annotator.get_layer_data("current_object")
+    curr[z] = seg
+    annotator.set_layer_data("current_object", curr)
 
 
 @magic_factory(call_button="Segment Frame [S]")
@@ -1083,10 +1192,10 @@ def segment_frame(viewer: "napari.viewer.Viewer") -> None:
 
     state = AnnotatorState()
     shape = state.image_shape[1:]
-    position = viewer.dims.point
+    position = AnnotatorState().annotator._viewer.dims.point
     t = int(position[0])
 
-    point_prompts = vutil.point_layer_to_prompts(viewer.layers["point_prompts"], i=t, track_id=state.current_track_id)
+    point_prompts = vutil.point_layer_to_prompts(AnnotatorState().annotator._viewer.layers["point_prompts"], i=t, track_id=state.current_track_id)
     # this is a stop prompt, we do nothing
     if not point_prompts:
         return
@@ -1105,12 +1214,13 @@ def segment_frame(viewer: "napari.viewer.Viewer") -> None:
         return
 
     # clear the old segmentation for this track_id
-    old_mask = viewer.layers["current_object"].data[t] == state.current_track_id
-    viewer.layers["current_object"].data[t][old_mask] = 0
+    curr = AnnotatorState().annotator.get_layer_data("current_object")
+    old_mask = curr[t] == state.current_track_id
+    curr[t][old_mask] = 0
     # set the new segmentation
     new_mask = seg.squeeze() == 1
-    viewer.layers["current_object"].data[t][new_mask] = state.current_track_id
-    viewer.layers["current_object"].refresh()
+    curr[t][new_mask] = state.current_track_id
+    AnnotatorState().annotator.set_layer_data("current_object", curr)
 
 
 #
@@ -1586,14 +1696,27 @@ class SegmentNDWidget(_WidgetBase):
             # then we need to create the two daughter tracks and update the lineage.
             if has_division and (len(state.lineage[state.current_track_id]) == 0):
                 _update_lineage(self._viewer)
-
-            # Clear the old track mask.
-            self._viewer.layers["current_object"].data[
-                self._viewer.layers["current_object"].data == state.current_track_id
-            ] = 0
-            # Set the new object mask.
-            self._viewer.layers["current_object"].data[seg == 1] = state.current_track_id
-            self._viewer.layers["current_object"].refresh()
+            # Clear the old track mask and set the new one using the annotator helper
+            try:
+                annotator = state.annotator
+                curr = annotator.get_layer_data("current_object")
+                curr[curr == state.current_track_id] = 0
+                curr[seg == 1] = state.current_track_id
+                annotator.set_layer_data("current_object", curr)
+                try:
+                    annotator._viewer.layers["current_object"].refresh()
+                except Exception:
+                    pass
+            except Exception:
+                # Fallback to direct napari layer manipulation if annotator isn't available
+                self._viewer.layers["current_object"].data[
+                    self._viewer.layers["current_object"].data == state.current_track_id
+                ] = 0
+                self._viewer.layers["current_object"].data[seg == 1] = state.current_track_id
+                try:
+                    self._viewer.layers["current_object"].refresh()
+                except Exception:
+                    pass
 
         ret_val = tracking_impl()
         update_segmentation(ret_val)
@@ -1634,12 +1757,35 @@ class SegmentNDWidget(_WidgetBase):
             return seg
 
         def update_segmentation(seg):
-            self._viewer.layers["current_object"].data = seg
-            self._viewer.layers["current_object"].refresh()
+            try:
+                annotator = AnnotatorState().annotator
+                annotator.set_layer_data("current_object", seg)
+                try:
+                    annotator._viewer.layers["current_object"].refresh()
+                except Exception:
+                    pass
+            except Exception:
+                # Fallback when no annotator is present
+                self._viewer.layers["current_object"].data = seg
+                try:
+                    self._viewer.layers["current_object"].refresh()
+                except Exception:
+                    pass
 
         seg = volumetric_segmentation_impl()
-        self._viewer.layers["current_object"].data = seg
-        self._viewer.layers["current_object"].refresh()
+        try:
+            annotator = AnnotatorState().annotator
+            annotator.set_layer_data("current_object", seg)
+            try:
+                annotator._viewer.layers["current_object"].refresh()
+            except Exception:
+                pass
+        except Exception:
+            self._viewer.layers["current_object"].data = seg
+            try:
+                self._viewer.layers["current_object"].refresh()
+            except Exception:
+                pass
         # worker = volumetric_segmentation_impl()
         # worker.returned.connect(update_segmentation)
         # worker.start()
@@ -1664,54 +1810,98 @@ class SegmentNDWidget(_WidgetBase):
 
 # Messy amg state handling, would be good to refactor this properly at some point.
 def _handle_amg_state(state, i, pbar_init, pbar_update):
+    # Ensure AMG object exists
     if state.amg is None:
-        is_tiled = state.image_embeddings["input_size"] is None
+        is_tiled = state.image_embeddings["input_size"] is None if state.image_embeddings is not None else False
         state.amg = instance_segmentation.get_amg(state.predictor, is_tiled, decoder=state.decoder)
 
     shape = state.image_shape
 
-    # Further optimization: refactor parts of this so that we can also use it in the automatic 3d segmentation fucnction
-    # For 3D we store the amg state in a dict and check if it is computed already.
-    if state.amg_state is not None:
-        assert i is not None
-        if i in state.amg_state:
-            amg_state_i = state.amg_state[i]
-            state.amg.set_state(amg_state_i)
+    # Special-case: if we are running inside a 4D annotator, try to bind per-timestep
+    # embeddings/amg_state into the global state so AMG can be initialized once for
+    # the whole timestep instead of per-slice.
+    try:
+        annot = getattr(state, "annotator", None)
+        if annot is not None and getattr(annot, "_is_4d", False):
+            # determine active timestep
+            try:
+                t = int(getattr(annot, "current_timestep", None) or annot._viewer.dims.current_step[0])
+            except Exception:
+                t = None
+            if t is not None:
+                try:
+                    # ensure embeddings are materialized/activated for this timestep
+                    if hasattr(annot, "_ensure_embeddings_active_for_t"):
+                        try:
+                            annot._ensure_embeddings_active_for_t(int(t))
+                        except Exception:
+                            pass
+                    entry = getattr(annot, "embeddings_4d", {}).get(int(t))
+                    if entry is not None:
+                        # bind embeddings and possible cached amg_state into AnnotatorState
+                        state.image_embeddings = entry
+                        if isinstance(entry, dict) and entry.get("path"):
+                            state.embedding_path = str(entry.get("path"))
+                        # if embedding entry carries a precomputed amg_state, adopt it
+                        if isinstance(entry, dict) and entry.get("amg_state") is not None:
+                            state.amg_state = entry.get("amg_state")
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
-        else:
-            dummy_image = np.zeros(shape[-2:], dtype="uint8")
+    # If we have a precomputed amg_state we prefer to use it. The amg_state
+    # might be either a single state (for a 3D volume) or a mapping of slice->state.
+    if state.amg_state is not None:
+        # If we have a per-slice mapping and an index was provided, try that first.
+        if isinstance(state.amg_state, dict) and i is not None and i in state.amg_state:
+            try:
+                state.amg.set_state(state.amg_state[i])
+                return
+            except Exception:
+                # fall back to trying full-state below
+                pass
+
+        # Try to apply the amg_state as a full 3D state.
+        try:
+            state.amg.set_state(state.amg_state)
+            return
+        except Exception:
+            # Fallback: try to initialize AMG for the requested index/volume
+            if i is None:
+                dummy_image = np.zeros(shape, dtype="uint8")
+            else:
+                dummy_image = np.zeros(shape[-2:], dtype="uint8")
+            try:
+                state.amg.initialize(
+                    dummy_image, image_embeddings=state.image_embeddings, i=i,
+                    verbose=pbar_init is not None, pbar_init=pbar_init, pbar_update=pbar_update,
+                )
+            except Exception:
+                pass
+            # Try to cache the initialized state
+            try:
+                state.amg_state = state.amg.get_state()
+            except Exception:
+                pass
+        return
+
+    # Otherwise, if AMG isn't initialized yet initialize it for the whole volume
+    # (no assert on i; AMG allows being initialized for 3D volumes)
+    try:
+        if not getattr(state.amg, "is_initialized", False):
+            if i is None:
+                dummy_image = np.zeros(shape, dtype="uint8")
+            else:
+                # when i provided initialize for a single slice
+                dummy_image = np.zeros(shape[-2:], dtype="uint8")
             state.amg.initialize(
                 dummy_image, image_embeddings=state.image_embeddings, i=i,
                 verbose=pbar_init is not None, pbar_init=pbar_init, pbar_update=pbar_update,
             )
-            amg_state_i = state.amg.get_state()
-            state.amg_state[i] = amg_state_i
-
-            cache_folder = state.amg_state.get("cache_folder", None)
-            if cache_folder is not None:
-                cache_path = os.path.join(cache_folder, f"state-{i}.pkl")
-                with open(cache_path, "wb") as f:
-                    pickle.dump(amg_state_i, f)
-
-            cache_path = state.amg_state.get("cache_path", None)
-            if cache_path is not None:
-                save_key = f"state-{i}"
-                with h5py.File(cache_path, "a") as f:
-                    g = f.create_group(save_key)
-                    g.create_dataset("foreground", data=amg_state_i["foreground"], compression="gzip")
-                    g.create_dataset("boundary_distances", data=amg_state_i["boundary_distances"], compression="gzip")
-                    g.create_dataset("center_distances", data=amg_state_i["center_distances"], compression="gzip")
-
-    # Otherwise (2d segmentation) we just check if the amg is initialized or not.
-    elif not state.amg.is_initialized:
-        assert i is None
-        # We don't need to pass the actual image data here, since the embeddings are passed.
-        # (The image data is only used by the amg to compute image embeddings, so not needed here.)
-        dummy_image = np.zeros(shape, dtype="uint8")
-        state.amg.initialize(
-            dummy_image, image_embeddings=state.image_embeddings,
-            verbose=pbar_init is not None, pbar_init=pbar_init, pbar_update=pbar_update
-        )
+    except Exception:
+        # best-effort: ignore initialization failures here
+        pass
 
 
 def _instance_segmentation_impl(with_background, min_object_size, i=None, pbar_init=None, pbar_update=None, **kwargs):
@@ -1906,11 +2096,27 @@ class AutoSegmentWidget(_WidgetBase):
             if is_empty:
                 self._empty_segmentation_warning()
 
-            if i is None:
-                self._viewer.layers["auto_segmentation"].data = seg
-            else:
-                self._viewer.layers["auto_segmentation"].data[i] = seg
-            self._viewer.layers["auto_segmentation"].refresh()
+            try:
+                annotator = AnnotatorState().annotator
+                if i is None:
+                    annotator.set_layer_data("auto_segmentation", seg)
+                else:
+                    curr = annotator.get_layer_data("auto_segmentation")
+                    curr[i] = seg
+                    annotator.set_layer_data("auto_segmentation", curr)
+                try:
+                    annotator._viewer.layers["auto_segmentation"].refresh()
+                except Exception:
+                    pass
+            except Exception:
+                if i is None:
+                    self._viewer.layers["auto_segmentation"].data = seg
+                else:
+                    self._viewer.layers["auto_segmentation"].data[i] = seg
+                try:
+                    self._viewer.layers["auto_segmentation"].refresh()
+                except Exception:
+                    pass
 
         # Validate all layers.
         _validate_layers(self._viewer, automatic_segmentation=True)
@@ -1930,7 +2136,11 @@ class AutoSegmentWidget(_WidgetBase):
         state = AnnotatorState()
         predictor = state.predictor
         if str(predictor.device) == "cpu" or str(predictor.device) == "mps":
-            n_slices = self._viewer.layers["auto_segmentation"].data.shape[0]
+            try:
+                annotator = AnnotatorState().annotator
+                n_slices = annotator.get_layer_data("auto_segmentation").shape[0]
+            except Exception:
+                n_slices = self._viewer.layers["auto_segmentation"].data.shape[0]
             embeddings_are_precomputed = (state.amg_state is not None) and (len(state.amg_state) > n_slices)
             if not embeddings_are_precomputed:
                 return False
@@ -1948,15 +2158,70 @@ class AutoSegmentWidget(_WidgetBase):
         pbar, pbar_signals = _create_pbar_for_threadworker()
 
         # @thread_worker
+        # Determine if we are running inside a 4D annotator and capture the active timestep
+        state_for_t = AnnotatorState()
+        t_for_4d = None
+        try:
+            annot_tmp = getattr(state_for_t, "annotator", None)
+            if annot_tmp is not None and getattr(annot_tmp, "_is_4d", False):
+                try:
+                    t_for_4d = int(getattr(annot_tmp, "current_timestep", None) or annot_tmp._viewer.dims.current_step[0])
+                except Exception:
+                    t_for_4d = None
+        except Exception:
+            t_for_4d = None
+
         def seg_impl():
-            segmentation = np.zeros_like(self._viewer.layers["auto_segmentation"].data)
+            try:
+                annotator = AnnotatorState().annotator
+                segmentation = np.zeros_like(annotator.get_layer_data("auto_segmentation"))
+            except Exception:
+                segmentation = np.zeros_like(self._viewer.layers["auto_segmentation"].data)
             offset = 0
 
             def pbar_init(total, description):
                 pbar_signals.pbar_total.emit(total)
                 pbar_signals.pbar_description.emit(description)
 
-            pbar_init(segmentation.shape[0], "Segment volume")
+            # If 4D, bind the per-timestep embeddings once so AMG initialization
+            # happens a single time for the whole 3D volume.
+            if t_for_4d is not None:
+                try:
+                    state = AnnotatorState()
+                    annot = getattr(state, "annotator", None)
+                    if annot is not None and getattr(annot, "_is_4d", False):
+                        try:
+                            if hasattr(annot, "_ensure_embeddings_active_for_t"):
+                                try:
+                                    annot._ensure_embeddings_active_for_t(int(t_for_4d))
+                                except Exception:
+                                    pass
+                            entry = getattr(annot, "embeddings_4d", {}).get(int(t_for_4d))
+                            if entry is not None:
+                                state.image_embeddings = entry
+                                if isinstance(entry, dict) and entry.get("path"):
+                                    state.embedding_path = str(entry.get("path"))
+                                if isinstance(entry, dict) and entry.get("amg_state") is not None:
+                                    state.amg_state = entry.get("amg_state")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # Initialize AMG once for the whole timestep (if in 4D) to avoid
+                # repeated per-slice initialization. We pass progress callbacks so
+                # initialization feedback is shown in the progress UI.
+                try:
+                    if t_for_4d is not None:
+                        try:
+                            state = AnnotatorState()
+                            _handle_amg_state(state, None, pbar_init, lambda update: pbar_signals.pbar_update.emit(update))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                pbar_init(segmentation.shape[0], "Segment volume")
 
             # Further optimization: parallelize if state is precomputed for all slices
             for i in range(segmentation.shape[0]):
@@ -1983,8 +2248,58 @@ class AutoSegmentWidget(_WidgetBase):
             is_empty = segmentation.max() == 0
             if is_empty:
                 self._empty_segmentation_warning()
-            self._viewer.layers["auto_segmentation"].data = segmentation
-            self._viewer.layers["auto_segmentation"].refresh()
+            # If running in 4D mode commit into the annotator's 4D container for this timestep
+            try:
+                state = AnnotatorState()
+                annotator = state.annotator
+                if annotator is not None and getattr(annotator, "_is_4d", False) and t_for_4d is not None:
+                    try:
+                        # ensure container exists and write per-timestep result
+                        if getattr(annotator, "auto_segmentation_4d", None) is None:
+                            annotator.auto_segmentation_4d = np.zeros_like(annotator.image_4d, dtype=np.uint32)
+                            try:
+                                if "auto_segmentation_4d" in annotator._viewer.layers:
+                                    annotator._viewer.layers["auto_segmentation_4d"].data = annotator.auto_segmentation_4d
+                                else:
+                                    annotator._viewer.add_labels(data=annotator.auto_segmentation_4d, name="auto_segmentation_4d")
+                            except Exception:
+                                pass
+                        annotator.auto_segmentation_4d[int(t_for_4d)] = segmentation
+                        layer = annotator._viewer.layers.get("auto_segmentation_4d", None)
+                        if layer is not None:
+                            layer.data[int(t_for_4d)] = segmentation
+                            try:
+                                layer.refresh()
+                            except Exception:
+                                pass
+                        return
+                    except Exception:
+                        # fallback to non-4d behavior below
+                        pass
+
+                # non-4d fallback: set whole auto_segmentation layer
+                try:
+                    annotator.set_layer_data("auto_segmentation", segmentation)
+                    try:
+                        annotator._viewer.layers["auto_segmentation"].refresh()
+                    except Exception:
+                        pass
+                except Exception:
+                    self._viewer.layers["auto_segmentation"].data = segmentation
+                    try:
+                        self._viewer.layers["auto_segmentation"].refresh()
+                    except Exception:
+                        pass
+            except Exception:
+                # Best-effort fallback
+                try:
+                    self._viewer.layers["auto_segmentation"].data = segmentation
+                    try:
+                        self._viewer.layers["auto_segmentation"].refresh()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
 
         seg = seg_impl()
         update_segmentation(seg)
@@ -2016,7 +2331,15 @@ class AutoSegmentWidget(_WidgetBase):
             worker = self._run_segmentation_2d(kwargs, i=i)
         else:
             worker = self._run_segmentation_2d(kwargs)
-        _select_layer(self._viewer, "auto_segmentation")
+        # Select whichever auto-segmentation layer exists (3D or 4D)
+        try:
+            if "auto_segmentation" in self._viewer.layers:
+                _select_layer(self._viewer, "auto_segmentation")
+            elif "auto_segmentation_4d" in self._viewer.layers:
+                _select_layer(self._viewer, "auto_segmentation_4d")
+        except Exception:
+            # best-effort: ignore selection failures
+            pass
         return worker
 
 
@@ -2058,8 +2381,16 @@ class AutoTrackWidget(AutoSegmentWidget):
         # @thread_worker
         def seg_impl():
             image_name = state.get_image_name(self._viewer)
-            timeseries = self._viewer.layers[image_name].data
-            segmentation = np.zeros_like(self._viewer.layers["auto_segmentation"].data)
+            try:
+                annotator = AnnotatorState().annotator
+                timeseries = annotator._viewer.layers[image_name].data
+            except Exception:
+                timeseries = self._viewer.layers[image_name].data
+            try:
+                annotator = AnnotatorState().annotator
+                segmentation = np.zeros_like(annotator.get_layer_data("auto_segmentation"))
+            except Exception:
+                segmentation = np.zeros_like(self._viewer.layers["auto_segmentation"].data)
             offset = 0
 
             def pbar_init(total, description):
@@ -2097,8 +2428,19 @@ class AutoTrackWidget(AutoSegmentWidget):
             state = AnnotatorState()
             state.lineage = lineages
 
-            self._viewer.layers["auto_segmentation"].data = segmentation
-            self._viewer.layers["auto_segmentation"].refresh()
+            try:
+                annotator = AnnotatorState().annotator
+                annotator.set_layer_data("auto_segmentation", segmentation)
+                try:
+                    annotator._viewer.layers["auto_segmentation"].refresh()
+                except Exception:
+                    pass
+            except Exception:
+                self._viewer.layers["auto_segmentation"].data = segmentation
+                try:
+                    self._viewer.layers["auto_segmentation"].refresh()
+                except Exception:
+                    pass
 
         result = seg_impl()
         update_segmentation(result)
@@ -2106,3 +2448,43 @@ class AutoTrackWidget(AutoSegmentWidget):
         # worker.returned.connect(update_segmentation)
         # worker.start()
         # return worker
+class MoveSegmentWidget(QWidget):
+    def __init__(self, annotator):
+        super().__init__()
+        self.annotator = annotator
+
+        layout = QVBoxLayout()
+        row = QHBoxLayout()
+
+        self.segment_input = QLineEdit()
+        self.segment_input.setPlaceholderText("Enter segment ID")
+
+        # Dropdown to select layer source
+        self.source_selector = QComboBox()
+        self.source_selector.addItems(["committed_objects", "auto_segmentation"])
+
+        self.move_button = QPushButton("Move Segment")
+        self.move_button.clicked.connect(self._on_move_clicked)
+
+        row.addWidget(self.segment_input)
+        row.addWidget(self.source_selector)
+        row.addWidget(self.move_button)
+        layout.addLayout(row)
+
+        self.status_label = QLabel("")
+        layout.addWidget(self.status_label)
+        self.setLayout(layout)
+
+    def _on_move_clicked(self):
+        segment_id_str = self.segment_input.text().strip()
+        source_layer = self.source_selector.currentText()
+
+        if not segment_id_str:
+            self.status_label.setText("⚠️ Please enter a segment ID.")
+            return
+
+        try:
+            self.annotator.move_segment(segment_id_str, source=source_layer)
+            self.status_label.setText(f"✅ Moved segment {segment_id_str} from {source_layer}")
+        except Exception as e:
+            self.status_label.setText(f"❌ Error: {e}")

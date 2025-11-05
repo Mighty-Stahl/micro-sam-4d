@@ -13,7 +13,16 @@ from .util import _initialize_parser, _sync_embedding_widget, _load_amg_state, _
 
 
 class Annotator3d(_AnnotatorBase):
+
+    def get_layer_by_name(self, name):
+        """Helper to find a layer by name safely."""
+        for layer in self._viewer.layers:
+            if layer.name == name:
+                return layer
+        return None
+
     def _get_widgets(self):
+        """Register widgets including MoveSegmentWidget."""
         autosegment = widgets.AutoSegmentWidget(self._viewer, with_decoder=self._with_decoder, volumetric=True)
         segment_nd = widgets.SegmentNDWidget(self._viewer, tracking=False)
         return {
@@ -22,7 +31,113 @@ class Annotator3d(_AnnotatorBase):
             "autosegment": autosegment,
             "commit": widgets.commit(),
             "clear": widgets.clear_volume(),
+            "move_segment": widgets.MoveSegmentWidget(self),
         }
+
+    def move_segment(self, segment_id_str, source="committed_objects"):
+        """Move a segment from one layer (committed or auto) to the current object layer."""
+        try:
+            segment_id = int(segment_id_str)
+        except ValueError:
+            print("Invalid segment ID.")
+            return
+        # Resolve source and current layer names robustly. Users running the 4D
+        # annotator often have layers named '<name>_4d' (e.g. 'committed_objects_4d').
+        def resolve_layer(name_candidates):
+            for n in name_candidates:
+                layer = self.get_layer_by_name(n)
+                if layer is not None:
+                    return layer, n
+            return None, None
+
+        # Candidate names to try for the source and current layers.
+        src_candidates = [source, f"{source}_4d"]
+        # Also try some common alternative names often present in the UI
+        if source == "committed_objects":
+            src_candidates.extend(["committed_objects_4d", "committed_objects_3d"])  # fallback names
+
+        source_layer, resolved_source_name = resolve_layer(src_candidates)
+        # Determine preferred current object layer name variants
+        cur_candidates = ["current_object", "current_object_4d", "current_object_3d"]
+        current_layer, resolved_current_name = resolve_layer(cur_candidates)
+
+        if source_layer is None:
+            available = [layer.name for layer in self._viewer.layers]
+            print(f"Source layer '{source}' not found. Available layers: {available}")
+            return
+
+        if current_layer is None:
+            available = [layer.name for layer in self._viewer.layers]
+            print(f"Target layer 'current_object' not found. Available layers: {available}")
+            return
+
+        if source_layer is None or current_layer is None:
+            print("Layers not found.")
+            return
+
+        source_data = source_layer.data
+        current_data = current_layer.data
+
+        # Determine whether layers are 4D (T, Z, Y, X). If so, operate only on
+        # the currently selected timepoint to avoid cross-timestep moves.
+        try:
+            dims_cs = tuple(self._viewer.dims.current_step)
+        except Exception:
+            dims_cs = None
+
+        if source_data.ndim == 4 and current_data.ndim == 4 and dims_cs is not None and len(dims_cs) >= 1:
+            # assume time is the first axis (T, Z, Y, X)
+            t = int(dims_cs[0])
+            # Use the annotator helpers which are 4D-aware and will write into the
+            # correct timestep slice. This avoids replacing Napari's underlying
+            # layer.data array and preserves references used elsewhere.
+            try:
+                src_slice = self.get_layer_data(source)
+                cur_slice = self.get_layer_data("current_object")
+            except Exception:
+                # Fallback to direct layer access if helper fails
+                src_slice = source_data[t]
+                cur_slice = current_data[t]
+
+            mask = src_slice == segment_id
+            if not np.any(mask):
+                print(f"⚠️ No voxels found for segment ID {segment_id} in '{source}' at t={t}.")
+                return
+
+            # Update slices in-place then write back using set_layer_data so the
+            # _AnnotatorBase logic can handle 4D vs 3D appropriately.
+            cur_slice = cur_slice.copy()
+            src_slice = src_slice.copy()
+            cur_slice[mask] = 1
+            src_slice[mask] = 0
+
+            try:
+                # set_layer_data will write into the correct timestep for 4D layers
+                self.set_layer_data(source, src_slice)
+                self.set_layer_data("current_object", cur_slice)
+            except Exception:
+                # Last-resort fallback: replace full layer.data (preserve previous behavior)
+                source_data[t] = src_slice
+                current_data[t] = cur_slice
+                source_layer.data = source_data
+                current_layer.data = current_data
+
+            print(f"✅ Moved segment {segment_id} from '{source}' to 'current_object' at t={t}.")
+
+        else:
+            # fallback: operate on the full array (3d or 2d)
+            mask = source_data == segment_id
+            if not np.any(mask):
+                print(f"⚠️ No voxels found for segment ID {segment_id} in '{source}'.")
+                return
+
+            with source_layer.events.data.blocker(), current_layer.events.data.blocker():
+                current_data[mask] = 1
+                source_data[mask] = 0
+                source_layer.data = source_data
+                current_layer.data = current_data
+
+            print(f"✅ Moved segment {segment_id} from '{source}' to 'current_object'.")
 
     def __init__(self, viewer: "napari.viewer.Viewer", reset_state: bool = True) -> None:
         self._with_decoder = AnnotatorState().decoder is not None
@@ -142,10 +257,10 @@ def main():
     else:
         segmentation_result = util.load_image_data(args.segmentation_result, key=args.segmentation_key)
 
-    annotator_3d(
-        image, embedding_path=args.embedding_path,
-        segmentation_result=segmentation_result,
-        model_type=args.model_type, tile_shape=args.tile_shape, halo=args.halo,
-        checkpoint_path=args.checkpoint, device=args.device,
-        precompute_amg_state=args.precompute_amg_state, prefer_decoder=args.prefer_decoder,
-    )
+        annotator_3d(
+            image, embedding_path=args.embedding_path,
+            segmentation_result=segmentation_result,
+            model_type=args.model_type, tile_shape=args.tile_shape, halo=args.halo,
+            checkpoint_path=args.checkpoint, device=args.device,
+            precompute_amg_state=args.precompute_amg_state, prefer_decoder=args.prefer_decoder,
+        )

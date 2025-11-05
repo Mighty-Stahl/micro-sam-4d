@@ -239,7 +239,8 @@ def image_series_annotator(
     def next_image(*args):
         nonlocal next_image_id
 
-        segmentation = viewer.layers["committed_objects"].data
+        annotator = AnnotatorState().annotator
+        segmentation = annotator.get_layer_data("committed_objects")
         abort = False
         if segmentation.sum() == 0:
             msg = "Nothing is segmented yet. Do you wish to continue to the next image?"
@@ -251,7 +252,8 @@ def image_series_annotator(
         _save_segmentation(images[next_image_id], next_image_id, segmentation)
 
         # Clear the segmentation already to avoid lagging removal.
-        viewer.layers["committed_objects"].data = np.zeros_like(viewer.layers["committed_objects"].data)
+        zeros = np.zeros(annotator.get_layer_data("committed_objects").shape, dtype="uint32")
+        annotator.set_layer_data("committed_objects", zeros)
 
         # Go to the next image.
         next_image_id += 1

@@ -303,7 +303,12 @@ def automatic_instance_segmentation(
         # We extract the segmentation in "committed_objects" layer, where the user either:
         # a) Performed interactive segmentation / corrections and committed them, OR
         # b) Did not do anything and closed the annotator, i.e. keeps the segmentations as it is.
-        instances = viewer.layers["committed_objects"].data
+        try:
+            from micro_sam.sam_annotator._state import AnnotatorState
+
+            instances = AnnotatorState().annotator.get_layer_data("committed_objects")
+        except Exception:
+            instances = viewer.layers["committed_objects"].data
 
         # Save the instance segmentation, if 'output_path' provided.
         if output_path is not None:
