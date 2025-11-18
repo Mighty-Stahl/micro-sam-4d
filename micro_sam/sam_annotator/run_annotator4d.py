@@ -118,9 +118,7 @@ def main(argv=None):
     # persistent 4D layers referencing this array.
     annot.update_image(image4d)
 
-    print("Demo loaded. Use the Napari time slider (T) to scrub timesteps.")
-    print("Add/edit labels on the 'committed_objects_4d' or 'current_object_4d' layer.")
-    print("After editing, call annot.commit_segmentation(seg_volume) programmatically to persist a slice.")
+    print("viewer loaded")
 
     # show Napari GUI (blocking)
     napari.run()

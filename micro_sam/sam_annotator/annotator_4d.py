@@ -342,6 +342,16 @@ class MicroSAM4DAnnotator(Annotator3d):
         # remember last directory where embeddings were saved/loaded
         self._last_embeddings_dir = None
 
+        # Desired layer order (bottom to top)
+        self._desired_layer_order = [
+            "raw_4d",
+            "current_object_4d",
+            "auto_segmentation_4d",
+            "committed_objects_4d",
+            "point_prompts",
+            "remap_points"
+        ]
+
         # Timestep embedding manager for lazy per-timestep zarr loading
         try:
             self.timestep_embedding_manager = TimestepEmbeddingManager(self)
@@ -516,17 +526,26 @@ class MicroSAM4DAnnotator(Annotator3d):
 
 
     def _reorder_layers(self):
-        """Ensure 'raw_4d' and optional 'raw' are the bottom-most layers."""
+        """Reorder layers according to desired order and persist across timestep changes."""
         try:
-            if "raw_4d" in self._viewer.layers:
-                # move raw_4d to bottom
-                self._viewer.layers.move("raw_4d", 0)
-            if "raw" in self._viewer.layers:
-                idx = 1 if "raw_4d" in self._viewer.layers else 0
-                self._viewer.layers.move("raw", idx)
-        except Exception:
-            # best effort; do not fail
-            pass
+            # Get all layer names currently in viewer
+            current_layers = [layer.name for layer in self._viewer.layers]
+            
+            # Filter desired order to only include layers that exist
+            existing_desired = [name for name in self._desired_layer_order if name in current_layers]
+            
+            # Move layers to desired positions (bottom to top)
+            for idx, layer_name in enumerate(existing_desired):
+                try:
+                    if layer_name in self._viewer.layers:
+                        current_idx = self._viewer.layers.index(layer_name)
+                        if current_idx != idx:
+                            self._viewer.layers.move(current_idx, idx)
+                except Exception as e:
+                    print(f"[WARN] Failed to move layer {layer_name}: {e}")
+                    
+        except Exception as e:
+            print(f"[WARN] Layer reordering failed: {e}")
 
             # DROPDOWN REMAPPER WIDGET IF YOU WANT IT BACK
             # # Create and add the ID remapper widget if not already added
@@ -646,9 +665,6 @@ class MicroSAM4DAnnotator(Annotator3d):
         except Exception as e:
             print(f"Error initializing 4D-aware point prompts: {e}")
 
-        # ensure raw_4d is bottom-most layer
-        self._reorder_layers()
-
         # ensure our local arrays are the same object as Napari layer data
         try:
             if "committed_objects_4d" in self._viewer.layers:
@@ -668,6 +684,12 @@ class MicroSAM4DAnnotator(Annotator3d):
             if not getattr(self, "_dims_handler_connected", False):
                 self._viewer.dims.events.current_step.connect(self._on_dims_current_step)
                 self._dims_handler_connected = True
+        except Exception:
+            pass
+        
+        # Apply desired layer order after all layers are created
+        try:
+            self._reorder_layers()
         except Exception:
             pass
 
@@ -1553,6 +1575,12 @@ class MicroSAM4DAnnotator(Annotator3d):
 
         except Exception as e:
             print(f"[WARN] Reload point prompts failed: {e}")
+        
+        # Restore layer order after timestep change
+        try:
+            self._reorder_layers()
+        except Exception:
+            pass
 
     def next_timestep(self):
         """Move to the next timestep (if available)."""
