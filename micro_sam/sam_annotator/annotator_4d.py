@@ -2479,7 +2479,7 @@ class MicroSAM4DAnnotator(Annotator3d):
                     from ._state import AnnotatorState
                     state = AnnotatorState()
                     
-                    print(f"  Segmenting slice {z_slice} with points at {points_2d}")
+                    print(f"  Segmenting slice {z_slice} with {len(points_2d)} point(s)")
                     
                     # Segment the initial slice using 2D segmentation
                     seg_2d = sam_util.prompt_segmentation(
@@ -2495,7 +2495,9 @@ class MicroSAM4DAnnotator(Annotator3d):
                     )
                     
                     if seg_2d is not None and seg_2d.max() > 0:
-                        print(f"  Initial 2D segmentation successful, extending to 3D volume")
+                        print(f"  Initial 2D segmentation successful, shape: {seg_2d.shape}")
+                        
+
                         
                         # Create 3D segmentation array
                         seg = np.zeros(shape, dtype=np.uint32)
@@ -2506,6 +2508,8 @@ class MicroSAM4DAnnotator(Annotator3d):
                         
                         segmented_slices = np.array([z_slice])
                         
+                        print(f"  Calling segment_mask_in_volume to extend segmentation...")
+                        
                         try:
                             seg, (z_min, z_max) = segment_mask_in_volume(
                                 seg,
@@ -2514,14 +2518,14 @@ class MicroSAM4DAnnotator(Annotator3d):
                                 segmented_slices,
                                 stop_lower=False,
                                 stop_upper=False,
-                                iou_threshold=0.5,
-                                projection="mask",
+                                iou_threshold=0.65,  # Increased from 0.5 to 0.7 to stop propagation sooner
+                                projection="single_point",  # Changed from "mask" to "single_point" for more conservative propagation
                                 verbose=False,
                             )
                             print(f"  Extended segmentation from slice {z_min} to {z_max}")
                         except Exception as e:
-                            print(f"  Note: Could not extend to full volume (using single slice only): {e}")
-                            # Keep the single slice segmentation
+                            print(f"  Failed to extend segmentation: {e}")
+                      
                     else:
                         seg = None
                     
