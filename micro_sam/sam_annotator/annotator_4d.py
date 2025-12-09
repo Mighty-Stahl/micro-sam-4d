@@ -164,11 +164,11 @@ class ObjectCommitWidget(QtWidgets.QWidget):
             
             # Update layers
             try:
-                committed_layer = self._annotator._viewer.layers.get("committed_objects_4d")
+                committed_layer = self._annotator._viewer.layers["committed_objects_4d"] if "committed_objects_4d" in self._annotator._viewer.layers else None
                 if committed_layer is not None:
                     committed_layer.refresh()
                 
-                current_layer = self._annotator._viewer.layers.get("current_object_4d")
+                current_layer = self._annotator._viewer.layers["current_object_4d"] if "current_object_4d" in self._annotator._viewer.layers else None
                 if current_layer is not None:
                     current_layer.refresh()
             except Exception:
@@ -339,11 +339,14 @@ class TimestepToolsWidget(QtWidgets.QWidget):
 
         btn_segment = QtWidgets.QPushButton("Segment all object(s) across timesteps")
         btn_commit = QtWidgets.QPushButton("Commit all objects across timesteps")
+        btn_segment_propagate = QtWidgets.QPushButton("Segment + Propagate across time")
 
         btn_segment.clicked.connect(lambda: self._safe_call(self._annotator.segment_all_timesteps))
         btn_commit.clicked.connect(lambda: self._safe_call(self._annotator.commit_all_timesteps))
+        btn_segment_propagate.clicked.connect(lambda: self._safe_call(self._annotator.segment_and_propagate_all_timesteps))
 
         layout.addWidget(btn_segment)
+        layout.addWidget(btn_segment_propagate)
         layout.addWidget(btn_commit)
         
         # Add copy point prompts UI
@@ -2309,7 +2312,7 @@ class MicroSAM4DAnnotator(Annotator3d):
                 except Exception:
                     pass
                 try:
-                    layer = self._viewer.layers.get("raw_4d", None)
+                    layer = self._viewer.layers["raw_4d"] if "raw_4d" in self._viewer.layers else None
                     if layer is not None:
                         scale = getattr(layer, "scale", None)
                         if scale is not None and len(scale) >= 4:
@@ -3072,6 +3075,634 @@ class MicroSAM4DAnnotator(Annotator3d):
         
         print(f"✅ All checks passed - ready for segmentation\n")
         return True
+
+    def segment_and_propagate_all_timesteps(self):
+        """Segment timesteps with point prompts, then propagate across time.
+        
+        This function:
+        1. Detects timesteps with point prompts
+        2. Segments each timestep with prompts (3D segmentation)
+        3. Propagates the segmentation across all timesteps using mask-based tracking
+        4. Stores results in current_object_4d
+        """
+        if self.image_4d is None or self.n_timesteps is None:
+            show_info("No 4D image loaded")
+            return
+
+        # Ensure container exists
+        if self.current_object_4d is None:
+            self.current_object_4d = np.zeros_like(self.image_4d, dtype=np.uint32)
+            try:
+                if "current_object_4d" in self._viewer.layers:
+                    self._viewer.layers["current_object_4d"].data = self.current_object_4d
+                else:
+                    self._viewer.add_labels(self.current_object_4d, name="current_object_4d")
+            except Exception:
+                pass
+
+        # Step 1: Detect timesteps with point prompts
+        prompt_map = getattr(self, "point_prompts_4d", None) or {}
+        current_t = getattr(self, "current_timestep", 0)
+        
+        # Check if current timestep has points in the layer
+        point_layer = self._viewer.layers["point_prompts"] if "point_prompts" in self._viewer.layers else None
+        current_has_points = False
+        if point_layer is not None:
+            current_points = np.array(point_layer.data)
+            current_has_points = len(current_points) > 0
+            if current_has_points and current_t not in prompt_map:
+                # Save current points to map so they're detected
+                prompt_map[current_t] = current_points
+        
+        prompt_timesteps = sorted([
+            t for t in range(self.n_timesteps)
+            if t in prompt_map and prompt_map[t] is not None and len(prompt_map[t]) > 0
+        ])
+        
+        print(f"📊 Debug: prompt_map keys: {list(prompt_map.keys())}")
+        print(f"📊 Current timestep: {current_t}, has points: {current_has_points}")
+        
+        if len(prompt_timesteps) == 0:
+            show_info("No timesteps with point prompts found. Please add point prompts first.")
+            return
+        
+        print(f"🔄 Found {len(prompt_timesteps)} timesteps with prompts: {prompt_timesteps}")
+        
+        # CRITICAL: Compute embeddings for ALL timesteps before propagation
+        print(f"\n🔧 Ensuring embeddings are computed for all {self.n_timesteps} timesteps...")
+        if hasattr(self, 'timestep_embedding_manager') and self.timestep_embedding_manager is not None:
+            for t in range(self.n_timesteps):
+                try:
+                    # Check if embeddings already exist
+                    entry = self.embeddings_4d.get(int(t)) if hasattr(self, "embeddings_4d") else None
+                    if entry is None:
+                        print(f"  Computing embeddings for t={t}...")
+                        self.timestep_embedding_manager.on_timestep_changed(int(t))
+                    else:
+                        print(f"  ✓ Embeddings already exist for t={t}")
+                except Exception as e:
+                    print(f"  ⚠ Failed to compute embeddings for t={t}: {e}")
+        else:
+            print(f"  ⚠ No timestep_embedding_manager available")
+        
+        print(f"\n")
+        
+        # Step 2: Segment each timestep with prompts (using existing segment_all_timesteps logic)
+        # We'll call the existing segmentation, but only for prompt timesteps
+        original_t = current_t
+        # point_layer already retrieved above
+        
+        # Disconnect callbacks during batch processing
+        dims_callback_disconnected = False
+        try:
+            self._viewer.dims.events.current_step.disconnect(self._on_dims_current_step)
+            dims_callback_disconnected = True
+        except Exception:
+            pass
+        
+        if point_layer is not None and hasattr(point_layer, 'events'):
+            try:
+                if hasattr(self, '_point_prompt_connection'):
+                    point_layer.events.data.disconnect(self._point_prompt_connection)
+            except Exception:
+                pass
+        
+        # Segment only timesteps with prompts
+        segmented_timesteps = {}  # Maps timestep -> list of object_ids
+        
+        for t in prompt_timesteps:
+            print(f"\n📍 Segmenting timestep {t}...")
+            
+            # Get points for this timestep
+            if t == original_t and point_layer is not None:
+                pts = np.array(point_layer.data)
+                print(f"  Using {len(pts)} points from current layer")
+            else:
+                pts = prompt_map.get(t, np.empty((0, 3)))
+                print(f"  Using {len(pts)} points from stored map")
+            
+            if len(pts) == 0:
+                print(f"  ⏭️  Skipping - no points found")
+                continue
+            
+            # Activate embeddings for this timestep
+            try:
+                self._ensure_embeddings_active_for_t(int(t))
+                from ._state import AnnotatorState
+                state = AnnotatorState()
+                
+                if state.image_embeddings is None:
+                    print(f"⚠ Embeddings not available for timestep {t}, skipping")
+                    continue
+                
+                # Set image metadata
+                if state.image_shape is None:
+                    image3d = self.image_4d[int(t)]
+                    state.image_shape = tuple(image3d.shape)
+            except Exception as e:
+                print(f"❌ Failed to activate embeddings for timestep {t}: {e}")
+                continue
+            
+            # Set point prompts
+            try:
+                if point_layer is not None:
+                    if hasattr(point_layer, 'events') and hasattr(point_layer.events, 'data'):
+                        with point_layer.events.data.blocker():
+                            point_layer.data = pts
+                    else:
+                        point_layer.data = pts
+            except Exception:
+                pass
+            
+            # Perform segmentation (similar to segment_all_timesteps)
+            try:
+                print(f"  Starting segmentation logic...")
+                from . import util as sam_util
+                from micro_sam.multi_dimensional_segmentation import segment_mask_in_volume
+                
+                image3d = self.image_4d[int(t)]
+                shape = image3d.shape
+                seg_merged = np.zeros(shape, dtype=np.uint32)
+                
+                print(f"  Image shape: {shape}")
+                
+                # Get point IDs
+                point_ids = self._get_point_ids_for_timestep(t, pts)
+                print(f"  Point IDs: {point_ids}")
+                
+                # Group points by ID
+                points_by_id = {}
+                for point_idx, point in enumerate(pts):
+                    point_id = point_ids[point_idx] if point_idx < len(point_ids) else 1
+                    if point_id not in points_by_id:
+                        points_by_id[point_id] = []
+                    points_by_id[point_id].append((point_idx, point))
+                
+                # Segment each ID group
+                object_ids = []
+                for target_id, points_list in points_by_id.items():
+                    # Collect negative prompts from other IDs
+                    negative_points_by_z = {}
+                    for other_id, other_points_list in points_by_id.items():
+                        if other_id != target_id:
+                            for _, other_point in other_points_list:
+                                z = int(other_point[0])
+                                if z not in negative_points_by_z:
+                                    negative_points_by_z[z] = []
+                                negative_points_by_z[z].append(other_point[1:3])
+                    
+                    # Group points by Z
+                    points_by_z = {}
+                    for point_idx, point in points_list:
+                        z = int(point[0])
+                        if z not in points_by_z:
+                            points_by_z[z] = []
+                        points_by_z[z].append(point[1:3])
+                    
+                    # Segment and extend
+                    id_seg = np.zeros(shape, dtype=np.uint32)
+                    shape_2d = shape[1:]
+                    
+                    for z_slice, pts_2d_list in points_by_z.items():
+                        pts_2d = np.array(pts_2d_list)
+                        pos_labels = np.ones(len(pts_2d), dtype=int)
+                        
+                        neg_pts_at_z = negative_points_by_z.get(z_slice, [])
+                        if len(neg_pts_at_z) > 0:
+                            neg_pts = np.array(neg_pts_at_z)
+                            all_points = np.vstack([pts_2d, neg_pts])
+                            all_labels = np.concatenate([pos_labels, np.zeros(len(neg_pts), dtype=int)])
+                        else:
+                            all_points = pts_2d
+                            all_labels = pos_labels
+                        
+                        seg_2d = sam_util.prompt_segmentation(
+                            state.predictor, all_points, all_labels,
+                            boxes=np.array([]), masks=None, shape=shape_2d,
+                            multiple_box_prompts=False,
+                            image_embeddings=state.image_embeddings, i=z_slice,
+                        )
+                        
+                        if seg_2d is not None and seg_2d.max() > 0:
+                            seg_3d = np.zeros(shape, dtype=np.uint32)
+                            seg_3d[z_slice] = (seg_2d > 0).astype(np.uint32)
+                            
+                            try:
+                                seg_3d, _ = segment_mask_in_volume(
+                                    seg_3d, state.predictor, state.image_embeddings,
+                                    np.array([z_slice]), stop_lower=False, stop_upper=False,
+                                    iou_threshold=0.65, projection="single_point", verbose=False,
+                                )
+                            except Exception:
+                                pass
+                            
+                            mask = seg_3d > 0
+                            id_seg[mask] = 1
+                    
+                    if id_seg.max() > 0:
+                        mask = id_seg > 0
+                        seg_merged[mask] = target_id
+                        object_ids.append(target_id)
+                        print(f"  ✓ Segmented object with ID {target_id}")
+                
+                if seg_merged.max() > 0:
+                    self.current_object_4d[int(t)] = seg_merged
+                    segmented_timesteps[t] = object_ids
+                    print(f"✅ Segmented timestep {t} with {len(object_ids)} objects")
+                    
+            except Exception as e:
+                print(f"❌ Segmentation failed for timestep {t}: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Step 3: Propagate across time for each object
+        if len(segmented_timesteps) == 0:
+            show_info("No objects were successfully segmented")
+            if dims_callback_disconnected:
+                try:
+                    self._viewer.dims.events.current_step.connect(self._on_dims_current_step)
+                except Exception:
+                    pass
+            return
+        
+        print(f"\n🔄 Starting temporal propagation...")
+        
+        # For each unique object ID across all segmented timesteps
+        all_object_ids = set()
+        for obj_ids in segmented_timesteps.values():
+            all_object_ids.update(obj_ids)
+        
+        for obj_id in sorted(all_object_ids):
+            print(f"\n📦 Propagating object ID {obj_id}...")
+            
+            # Find timesteps where this object exists
+            obj_timesteps = sorted([t for t, ids in segmented_timesteps.items() if obj_id in ids])
+            
+            if len(obj_timesteps) == 0:
+                continue
+            
+            print(f"  Object exists at timesteps: {obj_timesteps}")
+            
+            # Debug: show mask info for each anchor
+            for t_anchor in obj_timesteps:
+                mask_anchor = (self.current_object_4d[t_anchor] == obj_id)
+                z_slices_with_mask = np.where(mask_anchor.any(axis=(1, 2)))[0]
+                total_pixels = np.count_nonzero(mask_anchor)
+                print(f"    Anchor t={t_anchor}: {len(z_slices_with_mask)} z-slices, {total_pixels} total pixels")
+            
+            # Propagate from each anchor point in both directions
+            for i, t_anchor in enumerate(obj_timesteps):
+                mask_anchor = (self.current_object_4d[t_anchor] == obj_id)
+                
+                # Propagate backward from this anchor
+                if i == 0:
+                    # First anchor: propagate backward to start
+                    if t_anchor > 0:
+                        print(f"    Propagating backward from anchor t={t_anchor} to t=0")
+                        self._propagate_object_backward(obj_id, t_anchor, 0, mask_anchor)
+                else:
+                    # Not first anchor: propagate backward to previous anchor
+                    t_prev_anchor = obj_timesteps[i - 1]
+                    if t_anchor > t_prev_anchor + 1:
+                        print(f"    Propagating backward from anchor t={t_anchor} to t={t_prev_anchor + 1}")
+                        self._propagate_object_backward(obj_id, t_anchor, t_prev_anchor + 1, mask_anchor)
+                
+                # Propagate forward from this anchor
+                if i == len(obj_timesteps) - 1:
+                    # Last anchor: propagate forward to end
+                    if t_anchor < self.n_timesteps - 1:
+                        print(f"    Propagating forward from anchor t={t_anchor} to t={self.n_timesteps - 1}")
+                        self._propagate_object_forward(obj_id, t_anchor, self.n_timesteps, mask_anchor)
+                else:
+                    # Not last anchor: propagate forward to next anchor
+                    t_next_anchor = obj_timesteps[i + 1]
+                    if t_anchor < t_next_anchor - 1:
+                        print(f"    Propagating forward from anchor t={t_anchor} to t={t_next_anchor - 1}")
+                        self._propagate_object_forward(obj_id, t_anchor, t_next_anchor, mask_anchor)
+        
+        # Reconnect callbacks
+        if dims_callback_disconnected:
+            try:
+                self._viewer.dims.events.current_step.connect(self._on_dims_current_step)
+            except Exception:
+                pass
+        
+        if point_layer is not None and hasattr(point_layer, 'events'):
+            try:
+                if hasattr(self, '_point_prompt_connection'):
+                    point_layer.events.data.connect(self._point_prompt_connection)
+            except Exception:
+                pass
+        
+        # Restore original timestep
+        try:
+            self._viewer.dims.set_current_step(0, int(original_t))
+        except Exception:
+            pass
+        
+        # Refresh layer
+        try:
+            if "current_object_4d" in self._viewer.layers:
+                self._viewer.layers["current_object_4d"].refresh()
+        except Exception:
+            pass
+        
+        show_info("Segmentation and propagation complete!")
+        print(f"✅ Completed propagation for {len(all_object_ids)} objects")
+
+    def _extract_tyx_embeddings_for_z(self, z_slice):
+        """Extract embeddings for a specific Z-slice across all timesteps, organized as TYX.
+        
+        This reorganizes the per-timestep ZYX embedding structure into a TYX structure
+        where time becomes the first dimension, suitable for using segment_mask_in_volume
+        across the temporal dimension.
+        
+        Args:
+            z_slice: The Z-slice index to extract across all timesteps
+            
+        Returns:
+            ImageEmbeddings dict with 'features' as (T, C, H, W) array where T is time,
+            or None if extraction fails
+        """
+        print(f"      Creating TYX embeddings for Z={z_slice}...")
+        
+        # Collect embeddings for this z-slice across all timesteps
+        tyx_features_list = []
+        
+        for t in range(self.n_timesteps):
+            # Get embeddings for this timestep
+            entry = self.embeddings_4d.get(int(t))
+            if entry is None or not isinstance(entry, dict):
+                print(f"        ⚠ No embeddings for t={t}")
+                return None
+            
+            # Materialize if lazy
+            if "path" in entry and "features" not in entry:
+                try:
+                    self._load_embedding_for_timestep(int(t))
+                    entry = self.embeddings_4d.get(int(t))
+                except Exception as e:
+                    print(f"        ⚠ Failed to load embeddings for t={t}: {e}")
+                    return None
+            
+            if "features" not in entry:
+                print(f"        ⚠ No features in embeddings for t={t}")
+                return None
+            
+            features = entry["features"]
+            
+            # Convert to numpy array if it's a zarr array or other lazy type
+            if not isinstance(features, np.ndarray):
+                features = np.array(features)
+            
+            # Extract the z-slice from this timestep's embeddings
+            # Features shape can be:
+            # - (Z, C, H, W) for 3D embeddings
+            # - (Z, 1, C, H, W) for 3D embeddings with batch dimension
+            # - (C, H, W) for single slice
+            try:
+                if len(features.shape) == 5:
+                    # (Z, 1, C, H, W) - has batch dimension, squeeze it
+                    print(f"        t={t}: shape {features.shape}, squeezing batch dimension")
+                    features = features.squeeze(1)  # Now (Z, C, H, W)
+                    if z_slice < features.shape[0]:
+                        z_features = np.array(features[z_slice])  # (C, H, W)
+                    else:
+                        print(f"        ⚠ Z={z_slice} out of bounds for t={t} (max: {features.shape[0]-1})")
+                        return None
+                elif len(features.shape) == 4:
+                    # (Z, C, H, W) - extract specific z-slice
+                    if z_slice < features.shape[0]:
+                        z_features = np.array(features[z_slice])  # (C, H, W)
+                    else:
+                        print(f"        ⚠ Z={z_slice} out of bounds for t={t} (max: {features.shape[0]-1})")
+                        return None
+                elif len(features.shape) == 3:
+                    # (C, H, W) - single slice, use if z_slice == 0
+                    if z_slice == 0:
+                        z_features = np.array(features)
+                    else:
+                        print(f"        ⚠ Single-slice embedding at t={t}, but z_slice={z_slice}")
+                        return None
+                else:
+                    print(f"        ⚠ Unexpected embedding shape at t={t}: {features.shape}")
+                    return None
+                
+                tyx_features_list.append(z_features)
+            except Exception as e:
+                print(f"        ⚠ Error extracting Z={z_slice} from t={t}: {e}")
+                return None
+        
+        # Stack into (T, C, H, W)
+        try:
+            tyx_features = np.stack(tyx_features_list, axis=0)
+        except Exception as e:
+            print(f"        ⚠ Failed to stack features: {e}")
+            return None
+        
+        # Add a batch dimension to make it 5D: (T, 1, C, H, W)
+        # This is required because segment_mask_in_volume expects 5D embeddings
+        # to use indexing (treating T as Z-slices)
+        tyx_features = tyx_features[:, np.newaxis, :, :, :]
+        
+        # Create ImageEmbeddings dict
+        # Use the input_size and original_size from the first timestep as reference
+        first_entry = self.embeddings_4d.get(0)
+        input_size = first_entry.get("input_size") if isinstance(first_entry, dict) else None
+        original_size = first_entry.get("original_size") if isinstance(first_entry, dict) else None
+        
+        tyx_embeddings = {
+            "features": tyx_features,
+            "input_size": input_size,
+            "original_size": original_size,
+        }
+        
+        print(f"      ✓ Created TYX embeddings shape {tyx_features.shape}")
+        return tyx_embeddings
+
+    def _propagate_object_forward(self, obj_id, t_start, t_end, mask_start):
+        """Propagate an object mask forward in time using volumetric segmentation.
+        
+        For each z-slice where the object exists, create a TYX volume (treating time as Z)
+        and use segment_mask_in_volume to propagate across the temporal dimension.
+        This is the approach recommended by your mentor.
+        """
+        from micro_sam.multi_dimensional_segmentation import segment_mask_in_volume
+        from ._state import AnnotatorState
+        
+        print(f"  Propagating forward from t={t_start} to t={t_end} (exclusive)")
+        print(f"  Total timesteps in dataset: {self.n_timesteps}")
+        
+        # Find Z slices with mask at anchor
+        z_indices = np.where(mask_start.any(axis=(1, 2)))[0]
+        if len(z_indices) == 0:
+            print(f"    No z-slices with mask at anchor")
+            return
+        
+        z_min, z_max = int(z_indices[0]), int(z_indices[-1])
+        print(f"    Processing Z-slices {z_min}-{z_max} using volumetric propagation")
+        
+        # Get state for predictor
+        state = AnnotatorState()
+        
+        # For each z-slice, propagate across time using volumetric segmentation
+        for z in range(z_min, z_max + 1):
+            mask_2d_anchor = mask_start[z]
+            
+            if not mask_2d_anchor.any():
+                continue
+            
+            print(f"      Z={z}: Propagating using segment_mask_in_volume...")
+            
+            try:
+                # Extract TYX embeddings for this z-slice
+                tyx_embeddings = self._extract_tyx_embeddings_for_z(z)
+                if tyx_embeddings is None:
+                    print(f"      Z={z}: Failed to create TYX embeddings, skipping")
+                    continue
+                
+                # Create TYX segmentation volume (T, Y, X)
+                # Initialize with zeros for all timesteps
+                image_shape = self.image_4d[0].shape  # (Z, Y, X)
+                y_size, x_size = image_shape[1], image_shape[2]
+                tyx_seg = np.zeros((self.n_timesteps, y_size, x_size), dtype=np.uint32)
+                
+                # Set the anchor mask at t_start
+                tyx_seg[t_start] = mask_2d_anchor.astype(np.uint32)
+                
+                # Check for other anchor timesteps with this object in this z-slice
+                anchor_timesteps = [t_start]
+                for t_check in range(self.n_timesteps):
+                    if t_check != t_start and (self.current_object_4d[t_check][z] == obj_id).any():
+                        tyx_seg[t_check] = (self.current_object_4d[t_check][z] == obj_id).astype(np.uint32)
+                        anchor_timesteps.append(t_check)
+                
+                # Use segment_mask_in_volume to propagate across time dimension
+                # The "segmented_slices" parameter is the anchor timestep(s)
+                print(f"      Z={z}: Running segment_mask_in_volume with anchors at t={anchor_timesteps}...")
+                tyx_seg_result, (t_min, t_max) = segment_mask_in_volume(
+                    segmentation=tyx_seg,
+                    predictor=state.predictor,
+                    image_embeddings=tyx_embeddings,
+                    segmented_slices=np.array(anchor_timesteps),
+                    stop_lower=False,  # Propagate backward in time
+                    stop_upper=False,  # Propagate forward in time
+                    iou_threshold=0.5,
+                    projection="mask",  # Use mask projection
+                    verbose=False,
+                )
+                
+                print(f"      Z={z}: Propagated from t={t_min} to t={t_max}")
+                
+                # Write back to 4D volume: current_object_4d[:, z, :, :]
+                # Only write for timesteps between t_start and t_end
+                print(f"      Z={z}: Writing back results for timesteps {max(t_start, t_min)} to {min(t_end, t_max + 1) - 1}")
+                for t in range(max(t_start, t_min), min(t_end, t_max + 1)):
+                    if tyx_seg_result[t].any():
+                        # Only write where we have new segmentation
+                        mask_t = tyx_seg_result[t] > 0
+                        pixels_count = np.count_nonzero(mask_t)
+                        # Preserve this object's segmentation
+                        self.current_object_4d[t][z][mask_t] = obj_id
+                        print(f"      Z={z}: Wrote {pixels_count} pixels for t={t}")
+                    else:
+                        print(f"      Z={z}: No pixels for t={t}")
+                
+                print(f"      Z={z}: Complete")
+                
+            except Exception as e:
+                print(f"      Z={z}: Error during propagation - {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        print(f"    Forward propagation complete")
+
+    def _propagate_object_backward(self, obj_id, t_start, t_end, mask_start):
+        """Propagate an object mask backward in time using volumetric segmentation.
+        
+        Since segment_mask_in_volume propagates in both directions from anchors,
+        backward propagation uses the same volumetric approach as forward.
+        """
+        from micro_sam.multi_dimensional_segmentation import segment_mask_in_volume
+        from ._state import AnnotatorState
+        
+        print(f"  Propagating backward from t={t_start} to t={t_end}")
+        
+        # Find Z slices with mask at anchor
+        z_indices = np.where(mask_start.any(axis=(1, 2)))[0]
+        if len(z_indices) == 0:
+            print(f"    No z-slices with mask at anchor")
+            return
+        
+        z_min, z_max = int(z_indices[0]), int(z_indices[-1])
+        print(f"    Processing Z-slices {z_min}-{z_max} using volumetric propagation")
+        
+        # Get state for predictor
+        state = AnnotatorState()
+        
+        # For each z-slice, propagate across time using volumetric segmentation
+        for z in range(z_min, z_max + 1):
+            mask_2d_anchor = mask_start[z]
+            
+            if not mask_2d_anchor.any():
+                continue
+            
+            print(f"      Z={z}: Propagating using segment_mask_in_volume...")
+            
+            try:
+                # Extract TYX embeddings for this z-slice
+                tyx_embeddings = self._extract_tyx_embeddings_for_z(z)
+                if tyx_embeddings is None:
+                    print(f"      Z={z}: Failed to create TYX embeddings, skipping")
+                    continue
+                
+                # Create TYX segmentation volume (T, Y, X)
+                image_shape = self.image_4d[0].shape  # (Z, Y, X)
+                y_size, x_size = image_shape[1], image_shape[2]
+                tyx_seg = np.zeros((self.n_timesteps, y_size, x_size), dtype=np.uint32)
+                
+                # Set the anchor mask at t_start
+                tyx_seg[t_start] = mask_2d_anchor.astype(np.uint32)
+                
+                # Check for other anchor timesteps
+                anchor_timesteps = [t_start]
+                for t_check in range(self.n_timesteps):
+                    if t_check != t_start and (self.current_object_4d[t_check][z] == obj_id).any():
+                        tyx_seg[t_check] = (self.current_object_4d[t_check][z] == obj_id).astype(np.uint32)
+                        anchor_timesteps.append(t_check)
+                
+                # Use segment_mask_in_volume
+                print(f"      Z={z}: Running segment_mask_in_volume with anchors at t={anchor_timesteps}...")
+                tyx_seg_result, (t_min, t_max) = segment_mask_in_volume(
+                    segmentation=tyx_seg,
+                    predictor=state.predictor,
+                    image_embeddings=tyx_embeddings,
+                    segmented_slices=np.array(anchor_timesteps),
+                    stop_lower=False,
+                    stop_upper=True,  # Don't propagate forward (already done)
+                    iou_threshold=0.5,
+                    projection="mask",
+                    verbose=False,
+                )
+                
+                print(f"      Z={z}: Propagated from t={t_min} to t={t_max}")
+                
+                # Write back to 4D volume for timesteps between t_end and t_start
+                for t in range(max(t_end, t_min), min(t_start, t_max + 1)):
+                    if tyx_seg_result[t].any():
+                        mask_t = tyx_seg_result[t] > 0
+                        self.current_object_4d[t][z][mask_t] = obj_id
+                
+                print(f"      Z={z}: Complete")
+                
+            except Exception as e:
+                print(f"      Z={z}: Error during propagation - {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        print(f"    Backward propagation complete")
 
     def segment_all_timesteps(self):
         """Run manual segmentation for all timesteps that have point prompts.

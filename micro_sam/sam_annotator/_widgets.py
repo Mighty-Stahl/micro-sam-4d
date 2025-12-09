@@ -2273,7 +2273,7 @@ class AutoSegmentWidget(_WidgetBase):
                             except Exception:
                                 pass
                         annotator.auto_segmentation_4d[int(t_for_4d)] = segmentation
-                        layer = annotator._viewer.layers.get("auto_segmentation_4d", None)
+                        layer = annotator._viewer.layers["auto_segmentation_4d"] if "auto_segmentation_4d" in annotator._viewer.layers else None
                         if layer is not None:
                             layer.data[int(t_for_4d)] = segmentation
                             try:
