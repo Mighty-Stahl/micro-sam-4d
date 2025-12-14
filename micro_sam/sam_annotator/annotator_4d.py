@@ -106,16 +106,22 @@ class ObjectCommitWidget(QtWidgets.QWidget):
             print(f"Failed to add object entry: {e}")
     
     def _commit_single_object(self, obj_id: int, timestep: int):
-        """Commit a single object ID from current_object_4d to committed_objects_4d."""
+        """Commit a single object ID from ALL timesteps in current_object_4d to committed_objects_4d."""
         try:
             if self._annotator.current_object_4d is None:
                 show_info("No current objects to commit")
                 return
             
-            # Get mask for this specific object
-            mask = self._annotator.current_object_4d[timestep] == obj_id
-            if not np.any(mask):
-                show_info(f"Object ID {obj_id} not found in timestep {timestep}")
+            # Check if object exists in ANY timestep
+            n_timesteps = self._annotator.n_timesteps
+            found_in_any = False
+            for t in range(n_timesteps):
+                if np.any(self._annotator.current_object_4d[t] == obj_id):
+                    found_in_any = True
+                    break
+            
+            if not found_in_any:
+                show_info(f"Object ID {obj_id} not found in any timestep")
                 return
             
             # Ensure committed_objects_4d exists
@@ -126,39 +132,48 @@ class ObjectCommitWidget(QtWidgets.QWidget):
             max_id = int(self._annotator.segmentation_4d.max())
             new_id = max_id + 1
             
-            # Copy this object to committed layer
-            self._annotator.segmentation_4d[timestep][mask] = new_id
+            # Copy this object from ALL timesteps to committed layer
+            timesteps_committed = []
+            for t in range(n_timesteps):
+                mask = self._annotator.current_object_4d[t] == obj_id
+                if np.any(mask):
+                    self._annotator.segmentation_4d[t][mask] = new_id
+                    self._annotator.current_object_4d[t][mask] = 0
+                    timesteps_committed.append(t)
             
-            # Remove from current_object_4d
-            self._annotator.current_object_4d[timestep][mask] = 0
-            
-            # Remove point prompts associated with this object ID
+            # Remove point prompts associated with this object ID from ALL timesteps
+            total_prompts_removed = 0
             try:
-                if "point_prompts" in self._annotator._viewer.layers:
+                # Remove from all timesteps where this object exists
+                for t in timesteps_committed:
+                    # Remove from point_prompts_4d storage
+                    if hasattr(self._annotator, 'point_prompts_4d') and t in self._annotator.point_prompts_4d:
+                        pts = self._annotator.point_prompts_4d[t]
+                        if pts is not None and len(pts) > 0:
+                            point_ids = self._annotator._get_point_ids_for_timestep(t, pts)
+                            points_to_keep = []
+                            for point, pid in zip(pts, point_ids):
+                                if pid != obj_id:
+                                    points_to_keep.append(point)
+                                else:
+                                    # Remove from coordinate map
+                                    z, y, x = int(point[0]), int(point[1]), int(point[2])
+                                    key = (t, z, y, x)
+                                    if key in self._annotator.point_id_map:
+                                        del self._annotator.point_id_map[key]
+                                    total_prompts_removed += 1
+                            
+                            self._annotator.point_prompts_4d[t] = np.array(points_to_keep) if points_to_keep else np.empty((0, 3))
+                
+                # Also update current visible layer if on a committed timestep
+                current_t = getattr(self._annotator, 'current_timestep', 0)
+                if current_t in timesteps_committed and "point_prompts" in self._annotator._viewer.layers:
                     layer = self._annotator._viewer.layers["point_prompts"]
-                    points = np.array(layer.data)
-                    
-                    # Get IDs for all points
-                    point_ids = self._annotator._get_point_ids_for_timestep(timestep, points)
-                    
-                    # Find points with this object ID and remove them
-                    points_to_keep = []
-                    for idx, (point, pid) in enumerate(zip(points, point_ids)):
-                        if pid != obj_id:
-                            points_to_keep.append(point)
-                        else:
-                            # Remove from coordinate map
-                            z, y, x = int(point[0]), int(point[1]), int(point[2])
-                            key = (timestep, z, y, x)
-                            if key in self._annotator.point_id_map:
-                                del self._annotator.point_id_map[key]
-                    
-                    if len(points_to_keep) < len(points):
-                        # Update layer and stored data
-                        new_points = np.array(points_to_keep) if points_to_keep else np.empty((0, 3))
-                        layer.data = new_points
-                        self._annotator.point_prompts_4d[timestep] = new_points
-                        print(f"Removed {len(points) - len(points_to_keep)} point prompt(s) for object ID {obj_id}")
+                    pts = self._annotator.point_prompts_4d.get(current_t, np.empty((0, 3)))
+                    layer.data = pts
+                
+                if total_prompts_removed > 0:
+                    print(f"Removed {total_prompts_removed} point prompt(s) for object ID {obj_id} across {len(timesteps_committed)} timestep(s)")
             except Exception as e:
                 print(f"Warning: Could not remove point prompts: {e}")
             
@@ -174,7 +189,7 @@ class ObjectCommitWidget(QtWidgets.QWidget):
             except Exception:
                 pass
             
-            show_info(f"Committed object ID {obj_id} as new ID {new_id}")
+            show_info(f"Committed object ID {obj_id} as new ID {new_id} across {len(timesteps_committed)} timestep(s)")
             
             # Refresh both the object list and point list
             self.refresh_object_list()
@@ -3406,6 +3421,32 @@ class MicroSAM4DAnnotator(Annotator3d):
                 self._viewer.layers["current_object_4d"].refresh()
         except Exception:
             pass
+        
+        # Remove all point prompts after successful propagation
+        try:
+            if "point_prompts" in self._viewer.layers:
+                point_layer = self._viewer.layers["point_prompts"]
+                point_layer.data = np.empty((0, 3))
+                print(f"✅ Cleared all point prompts after propagation")
+            
+            # Clear stored point prompts from all timesteps
+            if hasattr(self, 'point_prompts_4d'):
+                for t in range(self.n_timesteps):
+                    if t in self.point_prompts_4d:
+                        self.point_prompts_4d[t] = np.empty((0, 3))
+            
+            # Clear point ID map
+            if hasattr(self, 'point_id_map'):
+                self.point_id_map.clear()
+            
+            # Refresh point manager widget if it exists
+            if hasattr(self, '_point_manager_widget'):
+                try:
+                    self._point_manager_widget.refresh_point_list()
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"⚠ Failed to clear point prompts: {e}")
         
         show_info("Segmentation and propagation complete!")
         print(f"✅ Completed propagation for {len(all_object_ids)} objects")
