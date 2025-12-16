@@ -1,0 +1,16 @@
+name: wormid-env
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - napari
+  - pyqt
+  - vigra
+  - xxhash
+  - nifty
+  - imageio
+  - h5py
+  - scikit-image
+  - pyopencl
+  - z5py
+  - affogato
