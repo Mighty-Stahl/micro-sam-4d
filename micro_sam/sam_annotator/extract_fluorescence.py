@@ -222,6 +222,66 @@ def plot_traces(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
     plt.show()
 
 
+def plot_dff_only(dff_traces: dict, output_path: Path = None):
+    """Plot only ΔF/F₀ traces for all neurons in a clean layout.
+    
+    Args:
+        dff_traces: ΔF/F₀ normalized traces
+        output_path: Optional path to save figure
+    """
+    neuron_ids = sorted(dff_traces.keys())
+    n_neurons = len(neuron_ids)
+    
+    # Create figure - one subplot per neuron
+    fig, axes = plt.subplots(n_neurons, 1, figsize=(12, 2.5 * n_neurons), sharex=True)
+    
+    # Handle single neuron case
+    if n_neurons == 1:
+        axes = [axes]
+    
+    # Get timepoints
+    first_trace = dff_traces[neuron_ids[0]]
+    timepoints = np.arange(len(first_trace))
+    
+    # Plot each neuron
+    for idx, neuron_id in enumerate(neuron_ids):
+        ax = axes[idx]
+        trace = dff_traces[neuron_id]
+        
+        # Plot trace
+        ax.plot(timepoints, trace, 'r-', linewidth=1.5, label=f'Neuron {neuron_id}')
+        ax.axhline(y=0, color='k', linestyle='--', alpha=0.3, linewidth=0.8)
+        
+        # Styling
+        ax.set_ylabel('ΔF/F₀', fontsize=11)
+        ax.set_title(f'Neuron {neuron_id}', fontsize=12, fontweight='bold', loc='left')
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='upper right')
+        
+        # Add statistics text
+        valid_data = trace[~np.isnan(trace)]
+        if len(valid_data) > 0:
+            stats_text = f'Min: {np.min(valid_data):.3f}  Max: {np.max(valid_data):.3f}  Mean: {np.mean(valid_data):.3f}'
+            ax.text(0.02, 0.95, stats_text, transform=ax.transAxes, 
+                   fontsize=9, verticalalignment='top',
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+    
+    # X-label only on bottom plot
+    axes[-1].set_xlabel('Timepoint', fontsize=11)
+    
+    # Overall title
+    fig.suptitle('ΔF/F₀ Fluorescence Traces', fontsize=14, fontweight='bold', y=0.995)
+    
+    plt.tight_layout()
+    
+    # Save or show
+    if output_path:
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        print(f"📊 ΔF/F₀ plot saved to: {output_path}")
+    
+    plt.show()
+
+
 def save_traces(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
                 background_trace: np.ndarray, output_path: Path):
     """Save all traces to NPZ file.
@@ -255,6 +315,69 @@ def save_traces(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
     print(f"   - corrected_traces: {corrected_array.shape}")
     print(f"   - dff_traces: {dff_array.shape}")
     print(f"   - background_trace: {background_trace.shape}")
+
+
+def save_traces_csv(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
+                    background_trace: np.ndarray, output_path: Path):
+    """Save all traces to CSV files.
+    
+    Creates separate CSV files for each processing stage.
+    
+    Args:
+        raw_traces: Raw fluorescence traces
+        corrected_traces: Background-subtracted traces
+        dff_traces: ΔF/F₀ traces
+        background_trace: Global background trace
+        output_path: Base path for CSV files (will append suffixes)
+    """
+    import csv
+    
+    neuron_ids = sorted(raw_traces.keys())
+    n_timesteps = len(background_trace)
+    
+    # Create CSV paths
+    base_path = output_path.with_suffix('')
+    raw_csv = f"{base_path}_raw.csv"
+    corrected_csv = f"{base_path}_corrected.csv"
+    dff_csv = f"{base_path}_dff.csv"
+    background_csv = f"{base_path}_background.csv"
+    
+    # Save raw traces
+    with open(raw_csv, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Timepoint'] + [f'Neuron_{nid}' for nid in neuron_ids])
+        for t in range(n_timesteps):
+            row = [t] + [raw_traces[nid][t] for nid in neuron_ids]
+            writer.writerow(row)
+    
+    # Save background-subtracted traces
+    with open(corrected_csv, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Timepoint'] + [f'Neuron_{nid}' for nid in neuron_ids])
+        for t in range(n_timesteps):
+            row = [t] + [corrected_traces[nid][t] for nid in neuron_ids]
+            writer.writerow(row)
+    
+    # Save ΔF/F₀ traces
+    with open(dff_csv, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Timepoint'] + [f'Neuron_{nid}' for nid in neuron_ids])
+        for t in range(n_timesteps):
+            row = [t] + [dff_traces[nid][t] for nid in neuron_ids]
+            writer.writerow(row)
+    
+    # Save background trace
+    with open(background_csv, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Timepoint', 'Background'])
+        for t in range(n_timesteps):
+            writer.writerow([t, background_trace[t]])
+    
+    print(f"\n💾 CSV files saved:")
+    print(f"   - Raw: {raw_csv}")
+    print(f"   - Corrected: {corrected_csv}")
+    print(f"   - ΔF/F₀: {dff_csv}")
+    print(f"   - Background: {background_csv}")
 
 
 def process_segmentation_file(npz_path: str) -> int:
@@ -321,13 +444,21 @@ def process_segmentation_file(npz_path: str) -> int:
     
     traces_path = output_dir / f"{npz_path.stem}_traces.npz"
     plot_path = output_dir / f"{npz_path.stem}_traces.png"
+    dff_plot_path = output_dir / f"{npz_path.stem}_dff_only.png"
+    csv_base_path = output_dir / "traces"
     
-    # Save traces
+    # Save traces (NPZ format)
     save_traces(raw_traces, corrected_traces, dff_traces, background_trace, traces_path)
     
-    # Plot results
+    # Save traces (CSV format)
+    save_traces_csv(raw_traces, corrected_traces, dff_traces, background_trace, csv_base_path)
+    
+    # Plot results - full pipeline
     print("\n📈 Generating plots...")
     plot_traces(raw_traces, corrected_traces, dff_traces, background_trace, plot_path)
+    
+    # Plot results - ΔF/F₀ only
+    plot_dff_only(dff_traces, dff_plot_path)
     
     print("\n✅ Processing complete!")
     return 0
