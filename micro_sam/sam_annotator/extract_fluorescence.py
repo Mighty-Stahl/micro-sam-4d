@@ -222,12 +222,13 @@ def plot_traces(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
     plt.show()
 
 
-def plot_dff_only(dff_traces: dict, output_path: Path = None):
+def plot_dff_only(dff_traces: dict, output_path: Path = None, neuron_names: dict = None):
     """Plot only ΔF/F₀ traces for all neurons in a clean layout.
     
     Args:
         dff_traces: ΔF/F₀ normalized traces
         output_path: Optional path to save figure
+        neuron_names: Optional dict mapping neuron_id -> neuron_name
     """
     neuron_ids = sorted(dff_traces.keys())
     n_neurons = len(neuron_ids)
@@ -248,13 +249,21 @@ def plot_dff_only(dff_traces: dict, output_path: Path = None):
         ax = axes[idx]
         trace = dff_traces[neuron_id]
         
+        # Get neuron name
+        if neuron_names and int(neuron_id) in neuron_names:
+            neuron_label = neuron_names[int(neuron_id)]
+            title = f'{neuron_label} (ID {neuron_id})'
+        else:
+            neuron_label = f'Neuron {neuron_id}'
+            title = neuron_label
+        
         # Plot trace
-        ax.plot(timepoints, trace, 'r-', linewidth=1.5, label=f'Neuron {neuron_id}')
+        ax.plot(timepoints, trace, 'r-', linewidth=1.5, label=neuron_label)
         ax.axhline(y=0, color='k', linestyle='--', alpha=0.3, linewidth=0.8)
         
         # Styling
         ax.set_ylabel('ΔF/F₀', fontsize=11)
-        ax.set_title(f'Neuron {neuron_id}', fontsize=12, fontweight='bold', loc='left')
+        ax.set_title(title, fontsize=12, fontweight='bold', loc='left')
         ax.grid(True, alpha=0.3)
         ax.legend(loc='upper right')
         
@@ -318,7 +327,7 @@ def save_traces(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
 
 
 def save_traces_csv(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
-                    background_trace: np.ndarray, output_path: Path):
+                    background_trace: np.ndarray, output_path: Path, neuron_names: dict = None):
     """Save all traces to CSV files.
     
     Creates separate CSV files for each processing stage.
@@ -329,11 +338,18 @@ def save_traces_csv(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
         dff_traces: ΔF/F₀ traces
         background_trace: Global background trace
         output_path: Base path for CSV files (will append suffixes)
+        neuron_names: Optional dict mapping neuron_id -> neuron_name (e.g., {1: 'AVAL', 2: 'AVAR'})
     """
     import csv
     
     neuron_ids = sorted(raw_traces.keys())
     n_timesteps = len(background_trace)
+    
+    # Create column headers with neuron names if available
+    if neuron_names:
+        headers = [neuron_names.get(int(nid), f'Neuron_{nid}') for nid in neuron_ids]
+    else:
+        headers = [f'Neuron_{nid}' for nid in neuron_ids]
     
     # Create CSV paths
     base_path = output_path.with_suffix('')
@@ -345,7 +361,7 @@ def save_traces_csv(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
     # Save raw traces
     with open(raw_csv, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['Timepoint'] + [f'Neuron_{nid}' for nid in neuron_ids])
+        writer.writerow(['Timepoint'] + headers)
         for t in range(n_timesteps):
             row = [t] + [raw_traces[nid][t] for nid in neuron_ids]
             writer.writerow(row)
@@ -353,7 +369,7 @@ def save_traces_csv(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
     # Save background-subtracted traces
     with open(corrected_csv, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['Timepoint'] + [f'Neuron_{nid}' for nid in neuron_ids])
+        writer.writerow(['Timepoint'] + headers)
         for t in range(n_timesteps):
             row = [t] + [corrected_traces[nid][t] for nid in neuron_ids]
             writer.writerow(row)
@@ -361,7 +377,7 @@ def save_traces_csv(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
     # Save ΔF/F₀ traces
     with open(dff_csv, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['Timepoint'] + [f'Neuron_{nid}' for nid in neuron_ids])
+        writer.writerow(['Timepoint'] + headers)
         for t in range(n_timesteps):
             row = [t] + [dff_traces[nid][t] for nid in neuron_ids]
             writer.writerow(row)
@@ -378,6 +394,42 @@ def save_traces_csv(raw_traces: dict, corrected_traces: dict, dff_traces: dict,
     print(f"   - Corrected: {corrected_csv}")
     print(f"   - ΔF/F₀: {dff_csv}")
     print(f"   - Background: {background_csv}")
+    if neuron_names:
+        print(f"   ✓ Using neuron names: {list(neuron_names.values())}")
+
+
+def load_neuron_names(segmentation_dir: Path) -> dict:
+    """Load neuron names from neuron_names.json if it exists.
+    
+    Args:
+        segmentation_dir: Directory to search for neuron_names.json
+        
+    Returns:
+        Dictionary mapping neuron_id -> neuron_name, or empty dict if not found
+    """
+    import json
+    
+    # Check multiple possible locations
+    possible_paths = [
+        segmentation_dir / "neuron_names.json",
+        segmentation_dir.parent / "neuron_names.json",
+        segmentation_dir.parent / "neuropal_prompts" / "neuron_names.json",
+    ]
+    
+    for names_path in possible_paths:
+        if names_path.exists():
+            try:
+                with open(names_path, 'r') as f:
+                    names_dict = json.load(f)
+                # Convert keys to integers
+                names_dict = {int(k): v for k, v in names_dict.items()}
+                print(f"\n✓ Loaded neuron names from: {names_path}")
+                print(f"  Found {len(names_dict)} named neurons: {list(names_dict.values())}")
+                return names_dict
+            except Exception as e:
+                print(f"⚠️  Failed to load neuron names from {names_path}: {e}")
+    
+    return {}
 
 
 def process_segmentation_file(npz_path: str) -> int:
@@ -447,18 +499,21 @@ def process_segmentation_file(npz_path: str) -> int:
     dff_plot_path = output_dir / f"{npz_path.stem}_dff_only.png"
     csv_base_path = output_dir / "traces"
     
+    # Try to load neuron names
+    neuron_names = load_neuron_names(npz_path.parent)
+    
     # Save traces (NPZ format)
     save_traces(raw_traces, corrected_traces, dff_traces, background_trace, traces_path)
     
-    # Save traces (CSV format)
-    save_traces_csv(raw_traces, corrected_traces, dff_traces, background_trace, csv_base_path)
+    # Save traces (CSV format with neuron names if available)
+    save_traces_csv(raw_traces, corrected_traces, dff_traces, background_trace, csv_base_path, neuron_names)
     
     # Plot results - full pipeline
     print("\n📈 Generating plots...")
     plot_traces(raw_traces, corrected_traces, dff_traces, background_trace, plot_path)
     
-    # Plot results - ΔF/F₀ only
-    plot_dff_only(dff_traces, dff_plot_path)
+    # Plot results - ΔF/F₀ only (with neuron names if available)
+    plot_dff_only(dff_traces, dff_plot_path, neuron_names)
     
     print("\n✅ Processing complete!")
     return 0

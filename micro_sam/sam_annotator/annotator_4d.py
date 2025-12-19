@@ -1064,6 +1064,14 @@ class MicroSAM4DAnnotator(Annotator3d):
             save_load_layout.addWidget(btn_load_points)
             point_layout.addWidget(save_load_row)
 
+            # NeuroPAL prompts button (separate row)
+            neuropal_row = QtWidgets.QWidget()
+            neuropal_layout = QtWidgets.QHBoxLayout()
+            neuropal_row.setLayout(neuropal_layout)
+            btn_load_neuropal = QtWidgets.QPushButton("Load NeuroPAL Prompts")
+            neuropal_layout.addWidget(btn_load_neuropal)
+            point_layout.addWidget(neuropal_row)
+
             def _save_point_prompts():
                 try:
                     # Select directory to save point prompts
@@ -1189,6 +1197,315 @@ class MicroSAM4DAnnotator(Annotator3d):
             btn_save_points.clicked.connect(_save_point_prompts)
             btn_load_points.clicked.connect(_load_point_prompts)
 
+            # Auto-place prompts button (separate row)
+            auto_row = QtWidgets.QWidget()
+            auto_layout = QtWidgets.QHBoxLayout()
+            auto_row.setLayout(auto_layout)
+            btn_auto_prompts = QtWidgets.QPushButton("Auto-Place Prompts")
+            btn_auto_prompts.setToolTip(
+                "Automatically place prompts at bright spots (intensity-based)\n"
+                "Works on raw image, no GPU needed, runs in <1 second"
+            )
+            auto_layout.addWidget(btn_auto_prompts)
+            point_layout.addWidget(auto_row)
+
+            def _auto_place_prompts():
+                """Automatically place point prompts at bright spots based on intensity."""
+                try:
+                    from scipy.ndimage import center_of_mass, label
+                    
+                    # Get current timestep image
+                    t = self.current_timestep
+                    if self.image_4d is None:
+                        show_info("⚠️ No image loaded. Load data first.")
+                        return
+                    
+                    image_3d = self.image_4d[t]  # (Z, Y, X)
+                    
+                    print(f"\n{'='*60}")
+                    print(f"🔍 Auto-detecting neurons at timestep {t}")
+                    print(f"{'='*60}")
+                    print(f"  Image shape: {image_3d.shape}")
+                    print(f"  Intensity range: {image_3d.min():.0f} to {image_3d.max():.0f}")
+                    
+                    # Fixed percentile threshold
+                    percentile = 98.3
+                    
+                    # Find threshold
+                    threshold = np.percentile(image_3d, percentile)
+                    print(f"  Threshold ({percentile}th percentile): {threshold:.0f}")
+                    
+                    # Create binary mask
+                    bright_mask = image_3d > threshold
+                    
+                    # Label connected regions
+                    labeled, num_features = label(bright_mask)
+                    print(f"  Found {num_features} bright regions")
+                    
+                    # Filter and get centroids
+                    prompts = []
+                    skipped_small = 0
+                    skipped_large = 0
+                    
+                    for region_id in range(1, num_features + 1):
+                        region_mask = labeled == region_id
+                        size = np.sum(region_mask)
+                        
+                        # Skip tiny regions (noise) - reduced from 10 to 5
+                        if size < 5:  # pixels
+                            skipped_small += 1
+                            continue
+                        
+                        # Skip huge regions (background artifacts)
+                        if size > 10000:
+                            print(f"    Skipping region {region_id}: too large ({size} px)")
+                            skipped_large += 1
+                            continue
+                        
+                        # Get centroid
+                        z, y, x = center_of_mass(region_mask)
+                        prompts.append([z, y, x])
+                        print(f"    ✓ Region {region_id}: size={size} px, center=({z:.1f}, {y:.1f}, {x:.1f})")
+                    
+                    if skipped_small > 0:
+                        print(f"  (Skipped {skipped_small} tiny regions < 5 pixels)")
+                    if skipped_large > 0:
+                        print(f"  (Skipped {skipped_large} large regions > 10000 pixels)")
+                    
+                    prompts = np.array(prompts)
+                    
+                    if len(prompts) == 0:
+                        show_info(
+                            f"⚠️ No bright spots found with threshold={threshold:.0f}\n\n"
+                            f"Try:\n"
+                            f"• Click button again and use LOWER percentile (e.g., 98.0)\n"
+                            f"• Check if neurons are visible in viewer\n"
+                            f"• Adjust image contrast\n\n"
+                            f"Current settings:\n"
+                            f"  Percentile: {percentile}\n"
+                            f"  Threshold: {threshold:.0f}\n"
+                            f"  Regions found: {num_features}\n"
+                            f"  After filtering: 0"
+                        )
+                        print("  ⚠️ No valid regions found after filtering")
+                        return
+                    
+                    print(f"\n  📍 Placing {len(prompts)} prompts...")
+                    
+                    # Add to point_prompts layer
+                    if "point_prompts" in self._viewer.layers:
+                        layer = self._viewer.layers["point_prompts"]
+                        existing = np.array(layer.data) if len(layer.data) > 0 else np.empty((0, 3))
+                        # Append to existing prompts
+                        if len(existing) > 0:
+                            prompts = np.vstack([existing, prompts])
+                            print(f"  Added to {len(existing)} existing prompts")
+                        layer.data = prompts
+                        layer.visible = True
+                    else:
+                        layer = self._viewer.add_points(
+                            prompts,
+                            name="point_prompts",
+                            size=10,
+                            face_color='orange',
+                            edge_color='white',
+                            edge_width=2,
+                            ndim=3
+                        )
+                    
+                    # Store in 4D map
+                    self.point_prompts_4d[t] = prompts
+                    
+                    # Assign IDs (sequential starting from current max ID)
+                    existing_ids = list(self.point_id_map.values()) if hasattr(self, 'point_id_map') and self.point_id_map else [0]
+                    start_id = max(existing_ids) + 1 if existing_ids else 1
+                    
+                    for i, point in enumerate(prompts):
+                        z, y, x = int(point[0]), int(point[1]), int(point[2])
+                        point_id = start_id + i
+                        self.point_id_map[(t, z, y, x)] = point_id
+                    
+                    # Update colors
+                    point_ids = self._get_point_ids_for_timestep(t, prompts)
+                    self._update_point_colors(layer, point_ids)
+                    
+                    # Refresh point manager widget if it exists
+                    if hasattr(self, '_point_manager_widget'):
+                        try:
+                            self._point_manager_widget.refresh_point_list()
+                        except Exception:
+                            pass
+                    
+                    print(f"{'='*60}")
+                    print(f"✅ Auto-placed {len(prompts)} prompts successfully!")
+                    print(f"{'='*60}\n")
+                    
+                    show_info(
+                        f"✓ Auto-placed {len(prompts)} prompts\n\n"
+                        f"Settings used:\n"
+                        f"  Percentile: {percentile}\n"
+                        f"  Threshold: {threshold:.0f}\n"
+                        f"  Regions found: {num_features}\n"
+                        f"  Valid prompts: {len(prompts)}\n\n"
+                        f"Too few? Click again and use LOWER percentile (e.g., 98.0)\n"
+                        f"Too many? Click again and use HIGHER percentile (e.g., 99.5)\n\n"
+                        f"Next: Click 'Segment Volume' to segment all neurons"
+                    )
+                    
+                except ImportError as e:
+                    show_info(f"⚠️ Missing dependency: {e}\n\nInstall scipy: pip install scipy")
+                    print(f"Failed to auto-place prompts: {e}")
+                except Exception as e:
+                    print(f"Failed to auto-place prompts: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    show_info(f"❌ Error: {str(e)}")
+
+            btn_auto_prompts.clicked.connect(_auto_place_prompts)
+
+            def _load_neuropal_prompts():
+                """Load NeuroPAL-derived point prompts with neuron names."""
+                try:
+                    from pathlib import Path
+                    import sys
+                    
+                    # Add NeuroPAL matching folder to path
+                    neuropal_path = Path(__file__).parent.parent / "Neuropal Coordinate Matching"
+                    if str(neuropal_path) not in sys.path:
+                        sys.path.insert(0, str(neuropal_path))
+                    
+                    from load_neuropal_prompts import load_neuropal_prompts, create_neuron_name_layer_data  # type: ignore
+                    
+                    # Select directory containing NeuroPAL prompts
+                    directory = QFileDialog.getExistingDirectory(
+                        None,
+                        "Select Directory Containing NeuroPAL Prompts",
+                        str(Path.home())
+                    )
+                    if not directory:
+                        return
+                    
+                    # Load prompts for timestep 0
+                    result = load_neuropal_prompts(directory, timestep=0)
+                    
+                    if not result['success']:
+                        show_info(f"Failed to load NeuroPAL prompts:\n{result['error']}")
+                        return
+                    
+                    # Initialize storage if needed
+                    if not hasattr(self, 'point_prompts_4d') or self.point_prompts_4d is None:
+                        self.point_prompts_4d = {}
+                    if not hasattr(self, 'point_id_map') or self.point_id_map is None:
+                        self.point_id_map = {}
+                    if not hasattr(self, 'neuron_names_map') or self.neuron_names_map is None:
+                        self.neuron_names_map = {}
+                    
+                    # Store prompts and IDs for timestep 0
+                    t = result['timestep']
+                    prompts = result['prompts']
+                    ids = result['ids']
+                    names = result['names']
+                    
+                    self.point_prompts_4d[t] = prompts
+                    self.neuron_names_map = names  # Store neuron names globally
+                    
+                    # Update point_id_map with neuron IDs
+                    for point, point_id in zip(prompts, ids):
+                        z, y, x = int(point[0]), int(point[1]), int(point[2])
+                        key = (t, z, y, x)
+                        self.point_id_map[key] = int(point_id)
+                    
+                    # Switch to timestep 0 to show the loaded prompts
+                    try:
+                        self._viewer.dims.current_step = (0,) + self._viewer.dims.current_step[1:]
+                        self.current_timestep = 0
+                    except Exception:
+                        pass
+                    
+                    # Update or create point prompts layer
+                    if "point_prompts" in self._viewer.layers:
+                        layer = self._viewer.layers["point_prompts"]
+                        layer.data = prompts
+                        layer.visible = True
+                        # Update colors based on IDs
+                        point_ids_list = [int(pid) for pid in ids]
+                        self._update_point_colors(layer, point_ids_list)
+                    else:
+                        # Create point prompts layer
+                        layer = self._viewer.add_points(
+                            prompts,
+                            name="point_prompts",
+                            size=10,
+                            face_color='red',
+                            edge_color='white',
+                            edge_width=2,
+                            ndim=3
+                        )
+                        # Update colors based on IDs
+                        point_ids_list = [int(pid) for pid in ids]
+                        self._update_point_colors(layer, point_ids_list)
+                    
+                    # Create or update neuron names layer
+                    layer_data = create_neuron_name_layer_data(prompts, ids, names)
+                    
+                    if "Neuron_Names" in self._viewer.layers:
+                        # Update existing layer
+                        name_layer = self._viewer.layers["Neuron_Names"]
+                        name_layer.data = layer_data['coordinates']
+                        name_layer.text = layer_data['text']
+                        name_layer.properties = layer_data['properties']
+                        name_layer.visible = True
+                    else:
+                        # Create new layer with proper visibility
+                        name_layer = self._viewer.add_points(
+                            layer_data['coordinates'],
+                            name="Neuron_Names",
+                            size=8,  # Small but visible points
+                            face_color='yellow',
+                            edge_color='yellow',
+                            edge_width=1,
+                            text=layer_data['text'],
+                            properties=layer_data['properties'],
+                            ndim=3
+                        )
+                        name_layer.visible = True
+                    
+                    # Refresh point manager widget if it exists
+                    if hasattr(self, '_point_manager_widget'):
+                        try:
+                            self._point_manager_widget.refresh_point_list()
+                        except Exception:
+                            pass
+                    
+                    # Force viewer refresh
+                    try:
+                        self._viewer.layers.selection.active = self._viewer.layers["point_prompts"]
+                        self._viewer.reset_view()
+                    except Exception:
+                        pass
+                    
+                    show_info(
+                        f"✓ Loaded {result['num_prompts']} NeuroPAL prompts\n"
+                        f"Neurons: {', '.join([names[int(pid)] for pid in ids])}\n"
+                        f"Switched to timestep 0"
+                    )
+                    
+                except ImportError as e:
+                    show_info(
+                        f"Failed to import NeuroPAL loader:\n{str(e)}\n\n"
+                        "Make sure load_neuropal_prompts.py exists in:\n"
+                        "micro_sam/Neuropal Coordinate Matching/"
+                    )
+                    import traceback
+                    traceback.print_exc()
+                except Exception as e:
+                    print(f"Failed to load NeuroPAL prompts: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    show_info(f"Failed to load NeuroPAL prompts:\n{str(e)}")
+
+            btn_load_neuropal.clicked.connect(_load_neuropal_prompts)
+
             # Insert the point prompt widget after embeddings widget
             try:
                 self._annotator_widget.layout().insertWidget(1, point_widget)
@@ -1222,7 +1539,7 @@ class MicroSAM4DAnnotator(Annotator3d):
 
             # Save segmentation button
             btn_save_seg = QtWidgets.QPushButton("💾 Save Segmentation")
-            btn_save_seg.setToolTip("Save raw image and committed segmentation masks to NPZ file")
+            btn_save_seg.setToolTip("Save raw ima ge and committed segmentation masks to NPZ file")
             
             def _save_segmentation():
                 try:
@@ -1262,6 +1579,17 @@ class MicroSAM4DAnnotator(Annotator3d):
                         shape=self.image_4d.shape,
                     )
                     
+                    # Save neuron names if available (for fluorescence extraction)
+                    if hasattr(self, 'neuron_names_map') and self.neuron_names_map:
+                        import json
+                        json_path = filepath.with_name(filepath.stem + '_neuron_names.json')
+                        try:
+                            with open(json_path, 'w') as f:
+                                json.dump(self.neuron_names_map, f, indent=2)
+                            print(f"   - Also saved neuron names to {json_path.name}")
+                        except Exception as e:
+                            print(f"   ⚠️ Could not save neuron names: {e}")
+                    
                     show_info(f"✅ Saved to {filepath.name}")
                     print(f"✅ Saved segmentation successfully!")
                     print(f"   - File: {filepath}")
@@ -1272,6 +1600,11 @@ class MicroSAM4DAnnotator(Annotator3d):
                     unique_ids = np.unique(self.segmentation_4d)
                     unique_ids = unique_ids[unique_ids > 0]  # Exclude background
                     print(f"   - Neurons saved: {len(unique_ids)} (IDs: {unique_ids.tolist()})")
+                    
+                    # Show neuron names if available
+                    if hasattr(self, 'neuron_names_map') and self.neuron_names_map:
+                        named_neurons = [self.neuron_names_map.get(int(nid), f"ID_{nid}") for nid in unique_ids]
+                        print(f"   - Neuron names: {', '.join(named_neurons)}")
                     
                 except Exception as e:
                     print(f"❌ Failed to save segmentation: {e}")
